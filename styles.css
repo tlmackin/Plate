@@ -206,3 +206,20 @@ table.rep tr.avg td { font-weight: 700; border-bottom: 0; }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
 .note { background: var(--surface-2); border-radius: 12px; padding: 10px 12px; font-size: 14px; color: var(--ink-2); margin-bottom: 12px; }
 a { color: var(--accent); }
+
+/* ---- Sign-in screens ---- */
+body:not(.in-app) .tabs { display: none; }
+body.auth-mode { padding-bottom: env(safe-area-inset-bottom); }
+body.auth-mode .topbar { display: none; }
+.auth { max-width: 420px; margin: 0 auto; padding: calc(env(safe-area-inset-top) + 28px) 0 24px; }
+.auth-logo { display: flex; align-items: center; gap: 14px; margin: 8px 4px 22px; }
+.auth-logo img { width: 56px; height: 56px; border-radius: 14px; }
+.auth-logo b { display: block; font-size: 26px; letter-spacing: -.02em; }
+.auth-logo span { color: var(--ink-2); font-size: 14px; }
+.auth-card { padding: 20px 18px; }
+.auth-card h2 { font-size: 20px; margin: 0 0 14px; }
+.auth-note { color: var(--ink); }
+.auth-err { color: var(--danger); font-size: 14px; min-height: 1em; margin: 0 0 10px; }
+.auth-err:empty { margin: 0; }
+.auth-links { display: flex; justify-content: space-between; gap: 10px; margin-top: 16px; font-size: 15px; font-weight: 600; }
+input[type=email], input[type=password] { width: 100%; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); font-size: 16px; }

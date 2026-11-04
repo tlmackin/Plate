@@ -1,16 +1,18 @@
-/* Plate — a private macro tracker. All data stays on this device (IndexedDB). */
+/* Plate — a macro tracker. Data is kept on the device (IndexedDB) and synced to the
+   signed-in person's private cloud account (Supabase) when one is configured. */
 (function () {
   'use strict';
   const C = window.Core;
   const { r1, num, MEALS } = C;
-  const VERSION = '1.0.0';
+  const VERSION = '1.1.0';
   const $ = (s, el = document) => el.querySelector(s);
   const $$ = (s, el = document) => [...el.querySelectorAll(s)];
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const today = () => C.ymd(new Date());
   const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+  const recoveryInUrl = /type=recovery/.test(location.hash); // password-reset link (checked before the auth client consumes the URL)
 
-  /* ================= Storage (IndexedDB key/value) ================= */
+  /* ================= Local storage (IndexedDB key/value) ================= */
   const DB = (() => {
     let dbp;
     const open = () => dbp || (dbp = new Promise((res, rej) => {
@@ -36,27 +38,156 @@
       clear: () => tx('readwrite', (s) => s.clear()),
     };
   })();
+  const isDataKey = (k) => typeof k === 'string' && !k.startsWith('_');
+
+  /* ---- Sync bookkeeping: which keys changed locally and when ---- */
+  const META_KEY = '_meta';
+  const freshMeta = () => ({ owner: null, updated: {}, dirty: [], cursor: null });
+  let meta = freshMeta();
+  async function loadMeta() { meta = Object.assign(freshMeta(), await DB.get(META_KEY)); }
+  const saveMeta = () => DB.set(META_KEY, meta);
+  /* Every app write goes through put(): saved locally right away, then queued for upload. */
+  async function put(k, v) {
+    await DB.set(k, v);
+    meta.updated[k] = Math.max(Date.now(), (meta.updated[k] || 0) + 1);
+    if (!meta.dirty.includes(k)) meta.dirty.push(k);
+    await saveMeta();
+    Sync.schedule();
+  }
+
+  /* ================= Cloud (Supabase) ================= */
+  const appUrl = () => location.origin + location.pathname;
+  function makeRemote() {
+    if (window.__PLATE_FAKE_REMOTE) return window.__PLATE_FAKE_REMOTE; // used by automated tests
+    const cfg = window.PLATE_CONFIG || {};
+    if (!cfg.supabaseUrl || !cfg.supabaseAnonKey || !window.supabase) return null;
+    const sb = window.supabase.createClient(cfg.supabaseUrl.trim(), cfg.supabaseAnonKey.trim(), {
+      auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
+    });
+    const T = 'plate_data';
+    const chk = ({ data, error }) => { if (error) throw error; return data; };
+    return {
+      async getUser() { const d = chk(await sb.auth.getSession()); return d.session ? d.session.user : null; },
+      onAuth(cb) { sb.auth.onAuthStateChange((ev, session) => cb(ev, session ? session.user : null)); },
+      async signIn(email, password) { return chk(await sb.auth.signInWithPassword({ email, password })).user; },
+      async signUp(email, password) {
+        const d = chk(await sb.auth.signUp({ email, password, options: { emailRedirectTo: appUrl() } }));
+        if (d.user && Array.isArray(d.user.identities) && d.user.identities.length === 0) {
+          const e = new Error('User already registered'); e.code = 'user_already_exists'; throw e;
+        }
+        return { user: d.user, hasSession: !!d.session };
+      },
+      async resetPassword(email) { chk(await sb.auth.resetPasswordForEmail(email, { redirectTo: appUrl() })); },
+      async setPassword(password) { chk(await sb.auth.updateUser({ password })); },
+      async signOut() { await sb.auth.signOut(); },
+      async push(rows) { chk(await sb.from(T).upsert(rows, { onConflict: 'user_id,key' })); },
+      async pull(since) {
+        const out = [];
+        for (let from = 0; ; from += 1000) {
+          let q = sb.from(T).select('key,value,updated_at,server_at').order('server_at', { ascending: true }).range(from, from + 999);
+          if (since) q = q.gt('server_at', since);
+          const rows = chk(await q);
+          out.push(...rows);
+          if (rows.length < 1000) break;
+        }
+        return out;
+      },
+      async wipe() { chk(await sb.from(T).delete().neq('key', '')); },
+    };
+  }
+  const remote = makeRemote();
+  let user = null; // { id, email } when signed in
+
+  const Sync = {
+    timer: null, busy: false, again: false, state: 'idle', lastOk: null, err: null, warned: false,
+    schedule(ms = 1200) {
+      if (!remote || !user) return;
+      clearTimeout(this.timer); this.timer = setTimeout(() => this.run(), ms);
+    },
+    setState(st, err) {
+      this.state = st; this.err = err || null;
+      if (st === 'ok') { this.lastOk = Date.now(); this.warned = false; }
+      if (st === 'error' && !this.warned) { this.warned = true; toast("Couldn't sync — your changes are saved here and will sync later", 3500); }
+      const el = $('#syncline'); if (el) el.innerHTML = syncLabel();
+    },
+    async run() {
+      if (!remote || !user) return;
+      if (this.busy) { this.again = true; return; }
+      if (!navigator.onLine) return this.setState('offline');
+      this.busy = true; this.setState('syncing');
+      try {
+        // 1) upload local changes
+        if (meta.dirty.length) {
+          const snap = {}; const rows = [];
+          for (const k of [...meta.dirty]) {
+            snap[k] = meta.updated[k] || Date.now();
+            const v = await DB.get(k);
+            rows.push({ user_id: user.id, key: k, value: v === undefined ? null : v, updated_at: snap[k] });
+          }
+          for (let i = 0; i < rows.length; i += 200) await remote.push(rows.slice(i, i + 200));
+          meta.dirty = meta.dirty.filter((k) => !(k in snap) || (meta.updated[k] || 0) > snap[k]); // keep keys edited mid-upload
+          await saveMeta();
+        }
+        // 2) download changes made on other devices (newest edit wins, per day / per list)
+        const since = meta.cursor ? new Date(Date.parse(meta.cursor) - 60000).toISOString() : null;
+        const rows = await remote.pull(since);
+        let changed = false, cursor = meta.cursor;
+        for (const r of rows) {
+          if (!cursor || Date.parse(r.server_at) > Date.parse(cursor)) cursor = r.server_at;
+          if (!isDataKey(r.key)) continue;
+          const ts = Number(r.updated_at) || 0;
+          if (ts > (meta.updated[r.key] || 0)) {
+            if (r.value === null) await DB.del(r.key); else await DB.set(r.key, r.value);
+            meta.updated[r.key] = ts;
+            meta.dirty = meta.dirty.filter((k) => k !== r.key);
+            changed = true;
+          }
+        }
+        meta.cursor = cursor; await saveMeta();
+        if (changed) { S.days.clear(); await loadState(); if (!sheets.length && document.body.classList.contains('in-app')) render(); }
+        this.setState('ok');
+      } catch (e) {
+        console.warn('sync failed', e);
+        this.setState(navigator.onLine ? 'error' : 'offline', e);
+      } finally {
+        this.busy = false;
+        if (this.again) { this.again = false; this.schedule(300); }
+      }
+    },
+  };
+  function syncLabel() {
+    const n = meta.dirty.length;
+    const t = Sync.lastOk ? new Date(Sync.lastOk).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }) : '';
+    if (Sync.state === 'syncing') return '<span class="spin"></span>Syncing…';
+    if (Sync.state === 'offline') return `Offline — ${n ? n + ' change' + (n > 1 ? 's' : '') + ' will' : 'changes will'} sync when you're back online.`;
+    if (Sync.state === 'error') return `Last sync failed${n ? ` (${n} change${n > 1 ? 's' : ''} waiting)` : ''}. Tap Sync now to retry.`;
+    if (n) return `${n} change${n > 1 ? 's' : ''} waiting to sync.`;
+    return t ? `✓ All changes synced · ${t}` : 'Not synced yet.';
+  }
 
   /* ================= State ================= */
+  const DEFAULT_SETTINGS = () => ({ name: '', targets: { kcal: 2000, p: 150, c: 200, f: 65 }, usdaKey: '' });
   const S = {
     tab: 'diary',
     date: today(),
     repStart: C.weekStart(today()),
-    settings: { name: '', targets: { kcal: 2000, p: 150, c: 200, f: 65 }, usdaKey: '' },
+    settings: DEFAULT_SETTINGS(),
     myFoods: [], favs: [], recents: [], meals: [],
     days: new Map(),
   };
   async function loadState() {
     const [settings, myFoods, favs, recents, meals] = await Promise.all(['settings', 'myFoods', 'favs', 'recents', 'meals'].map((k) => DB.get(k)));
-    if (settings) S.settings = Object.assign(S.settings, settings, { targets: Object.assign({}, S.settings.targets, settings.targets) });
+    const d = DEFAULT_SETTINGS();
+    S.settings = Object.assign(d, settings || {}, { targets: Object.assign(d.targets, (settings && settings.targets) || {}) });
     S.myFoods = myFoods || []; S.favs = favs || []; S.recents = recents || []; S.meals = meals || [];
   }
-  const save = (k) => DB.set(k, S[k]);
+  const save = (k) => put(k, S[k]);
+  const saveSettings = () => put('settings', S.settings);
   async function getDay(date) {
     if (!S.days.has(date)) S.days.set(date, (await DB.get('day:' + date)) || []);
     return S.days.get(date);
   }
-  async function setDay(date, entries) { S.days.set(date, entries); await DB.set('day:' + date, entries); }
+  async function setDay(date, entries) { S.days.set(date, entries); await put('day:' + date, entries); }
 
   function touchRecent(food) {
     S.recents = [food, ...S.recents.filter((f) => f.key !== food.key)].slice(0, 60);
@@ -781,7 +912,16 @@
   function renderSettings() {
     $('#topbar').innerHTML = `<h1>Settings</h1>`;
     const s = S.settings, T = s.targets;
+    const cloud = !!(remote && user);
     $('#view').innerHTML = `
+      ${cloud ? `<section class="card">
+        <h2 style="margin-bottom:4px">Account</h2>
+        <p class="small muted" style="margin:0 0 6px">Signed in as <b>${esc(user.email || '')}</b></p>
+        <p class="small" id="syncline" style="margin:0 0 12px">${syncLabel()}</p>
+        <div class="btnrow"><button class="btn secondary" id="a-sync">Sync now</button><button class="btn secondary" id="a-pass">Change password</button></div>
+        <div style="margin-top:10px"><button class="btn danger" id="a-out">Sign out</button></div>
+      </section>` : `<section class="card"><h2 style="margin-bottom:6px">Account</h2>
+        <p class="hint" style="margin:0">Using Plate on this phone only (no account). Cloud sign-in turns on once the app's Supabase settings are filled in — see the README.</p></section>`}
       <section class="card">
         <h2 style="margin-bottom:12px">Daily targets</h2>
         <label class="f"><span>Calories (kcal)</span><input type="text" inputmode="numeric" id="t-k" value="${esc(T.kcal || '')}"></label>
@@ -800,21 +940,20 @@
       </section>
       <section class="card">
         <h2 style="margin-bottom:6px">USDA search key</h2>
-        <p class="hint" style="margin:0 0 10px">Whole-food search works without a key, but the shared demo key only allows a few dozen searches per hour. A free personal key (instant, by email) raises that to 1,000/hour. It's stored only on this phone.
+        <p class="hint" style="margin:0 0 10px">Whole-food search works without a key, but the shared demo key only allows a few dozen searches per hour. A free personal key (instant, by email) raises that to 1,000/hour.${cloud ? ' It\'s saved with your account.' : ''}
           <a href="https://fdc.nal.usda.gov/api-key-signup" target="_blank" rel="noopener">Get a free key</a></p>
         <label class="f"><span>API key</span><input type="text" id="s-key" value="${esc(s.usdaKey)}" placeholder="DEMO_KEY" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
         <button class="btn secondary" id="s-keysave">Save key</button>
       </section>
       <section class="card">
-        <h2 style="margin-bottom:6px">Backup</h2>
-        <p class="hint" style="margin:0 0 10px">Your log lives only on this phone — nothing is uploaded. Make a backup now and then (e.g. save it to iCloud Drive or Google Drive) so a lost phone doesn't mean a lost log.</p>
-        <div class="btnrow"><button class="btn secondary" id="b-exp">Back up</button><button class="btn secondary" id="b-imp">Restore</button></div>
+        <h2 style="margin-bottom:6px">Backup file</h2>
+        <p class="hint" style="margin:0 0 10px">${cloud ? 'Your log is already saved to your account. A backup file is an extra copy you control.' : 'Your log lives only on this phone. Make a backup now and then (e.g. to iCloud Drive or Google Drive).'}</p>
+        <div class="btnrow"><button class="btn secondary" id="b-exp">Download backup</button><button class="btn secondary" id="b-imp">Restore</button></div>
         <input type="file" id="b-file" accept="application/json,.json" hidden>
-        <p class="small muted" id="persist" style="margin:10px 0 0"></p>
       </section>
       <section class="card small muted">
         <p style="margin-top:0"><b>Plate</b> v${VERSION}. Food data from <a href="https://world.openfoodfacts.org" target="_blank" rel="noopener">Open Food Facts</a> (Open Database License) and <a href="https://fdc.nal.usda.gov" target="_blank" rel="noopener">USDA FoodData Central</a>. Community data can contain mistakes — compare with the label for foods you eat often.</p>
-        <button class="btn danger" id="wipe">Erase all data on this phone</button>
+        <button class="btn danger" id="wipe">${cloud ? 'Erase all my data' : 'Erase all data on this phone'}</button>
       </section>`;
     const hint = () => {
       const p = num($('#t-p').value) || 0, c = num($('#t-c').value) || 0, f = num($('#t-f').value) || 0;
@@ -825,12 +964,17 @@
     ['#t-k', '#t-p', '#t-c', '#t-f'].forEach((id) => $(id).oninput = hint); hint();
     $('#t-save').onclick = async () => {
       s.targets = { kcal: num($('#t-k').value) || 0, p: num($('#t-p').value) || 0, c: num($('#t-c').value) || 0, f: num($('#t-f').value) || 0 };
-      await DB.set('settings', s); toast('Targets saved');
+      await saveSettings(); toast('Targets saved');
     };
-    $('#s-namesave').onclick = async () => { s.name = $('#s-name').value.trim(); await DB.set('settings', s); toast('Saved'); };
-    $('#s-keysave').onclick = async () => { s.usdaKey = $('#s-key').value.trim(); cache.clear(); await DB.set('settings', s); toast('Key saved'); };
+    $('#s-namesave').onclick = async () => { s.name = $('#s-name').value.trim(); await saveSettings(); toast('Saved'); };
+    $('#s-keysave').onclick = async () => { s.usdaKey = $('#s-key').value.trim(); cache.clear(); await saveSettings(); toast('Key saved'); };
+    if (cloud) {
+      $('#a-sync').onclick = () => Sync.run();
+      $('#a-pass').onclick = () => openPasswordSheet();
+      $('#a-out').onclick = signOut;
+    }
     $('#b-exp').onclick = async () => {
-      const keys = await DB.keys(); const data = {};
+      const keys = (await DB.keys()).filter(isDataKey); const data = {};
       for (const k of keys) data[k] = await DB.get(k);
       const blob = new Blob([JSON.stringify({ app: 'plate', version: 1, exported: new Date().toISOString(), data })], { type: 'application/json' });
       shareFile(blob, `plate-backup-${today()}.json`, 'Plate backup');
@@ -841,40 +985,196 @@
       try {
         const j = JSON.parse(await f.text());
         if (j.app !== 'plate' || !j.data) throw new Error('bad');
-        if (!confirm('Replace everything on this phone with this backup?')) return;
-        await DB.clear();
-        for (const [k, v] of Object.entries(j.data)) await DB.set(k, v);
+        if (!confirm(cloud ? 'Load this backup into your account? Days and foods in the backup replace the same days and lists in your account.' : 'Replace everything on this phone with this backup?')) return;
+        if (!cloud) { await DB.clear(); meta = Object.assign(freshMeta(), { owner: meta.owner }); }
+        for (const [k, v] of Object.entries(j.data)) if (isDataKey(k)) await put(k, v);
         S.days.clear(); await loadState(); toast('Backup restored'); renderSettings();
       } catch (err) { toast("That file isn't a Plate backup"); }
       e.target.value = '';
     };
     $('#wipe').onclick = async () => {
-      if (!confirm('Erase your entire log, foods, meals and settings on this phone? This cannot be undone.')) return;
-      if (!confirm('Really erase everything? Consider making a backup first.')) return;
+      if (!confirm(cloud ? 'Erase your entire log, foods, meals and settings — on every device and in your account? This cannot be undone.' : 'Erase your entire log, foods, meals and settings on this phone? This cannot be undone.')) return;
+      if (!confirm('Really erase everything? Consider downloading a backup first.')) return;
+      try { if (cloud) await remote.wipe(); }
+      catch (err) { return toast("Couldn't reach your account — nothing was erased. Try again online."); }
+      const owner = meta.owner;
       await DB.clear(); S.days.clear();
-      Object.assign(S, { myFoods: [], favs: [], recents: [], meals: [] });
-      S.settings = { name: '', targets: { kcal: 2000, p: 150, c: 200, f: 65 }, usdaKey: '' };
+      meta = Object.assign(freshMeta(), { owner }); await saveMeta();
+      await loadState();
       toast('Erased'); renderSettings();
     };
-    if (navigator.storage && navigator.storage.persisted) {
-      navigator.storage.persisted().then((p) => { const el = $('#persist'); if (el) el.textContent = p ? 'Storage is protected from automatic cleanup.' : ''; });
+  }
+
+  /* ================= Accounts: sign in / sign up / reset ================= */
+  function authError(e) {
+    const m = String((e && (e.code || e.message)) || e || '');
+    const st = e && e.status;
+    if (!navigator.onLine || /fetch|network|Failed to fetch|Load failed/i.test(m)) return "Can't reach the server. Check your connection and try again.";
+    if (/invalid_credentials|Invalid login credentials/i.test(m)) return 'Wrong email or password.';
+    if (/email_not_confirmed|Email not confirmed/i.test(m)) return 'Please confirm your email first — check your inbox (and spam folder) for the link.';
+    if (/user_already_exists|already registered/i.test(m)) return 'That email already has an account. Sign in instead.';
+    if (/weak_password|Password should be/i.test(m)) return 'Choose a longer password (at least 8 characters).';
+    if (/rate|too many/i.test(m) || st === 429) return 'Too many attempts. Wait a few minutes and try again.';
+    if (/signup_disabled|Signups not allowed/i.test(m)) return 'New accounts are turned off for this app.';
+    if (/same_password|different from the old/i.test(m)) return 'Pick a password different from your old one.';
+    return 'Something went wrong: ' + (e && e.message ? e.message : m);
+  }
+  function showAuth(mode, notice) {
+    document.body.classList.remove('in-app'); document.body.classList.add('auth-mode');
+    $('#topbar').innerHTML = '';
+    const v = $('#view');
+    const head = `<div class="auth-logo"><img src="icons/icon-192.png" alt=""><div><b>Plate</b><span>Food & macro log</span></div></div>`;
+    const note = notice ? `<div class="note auth-note">${notice}</div>` : '';
+    const field = (id, label, type, ac, extra = '') => `<label class="f"><span>${label}</span><input type="${type}" id="${id}" autocomplete="${ac}" ${extra}></label>`;
+    const forms = {
+      signin: `<h2>Sign in</h2>${note}
+        <form id="af">${field('a-email', 'Email', 'email', 'email', 'inputmode="email" autocapitalize="off" required')}${field('a-pw', 'Password', 'password', 'current-password', 'required')}
+        <p class="auth-err" id="a-err" role="alert"></p><button class="btn" type="submit">Sign in</button></form>
+        <div class="auth-links"><a href="#" data-m="forgot">Forgot password?</a><a href="#" data-m="signup">Create an account</a></div>`,
+      signup: `<h2>Create your account</h2>${note}<p class="hint">Each person gets their own private log. Use an email you can check — you'll get a confirmation link.</p>
+        <form id="af">${field('a-email', 'Email', 'email', 'email', 'inputmode="email" autocapitalize="off" required')}${field('a-pw', 'Password (8+ characters)', 'password', 'new-password', 'minlength="8" required')}${field('a-pw2', 'Confirm password', 'password', 'new-password', 'required')}
+        <p class="auth-err" id="a-err" role="alert"></p><button class="btn" type="submit">Create account</button></form>
+        <div class="auth-links"><a href="#" data-m="signin">I already have an account</a></div>`,
+      forgot: `<h2>Reset password</h2>${note}<p class="hint">We'll email you a link to choose a new password.</p>
+        <form id="af">${field('a-email', 'Email', 'email', 'email', 'inputmode="email" autocapitalize="off" required')}
+        <p class="auth-err" id="a-err" role="alert"></p><button class="btn" type="submit">Send reset link</button></form>
+        <div class="auth-links"><a href="#" data-m="signin">Back to sign in</a></div>`,
+      newpass: `<h2>Choose a new password</h2>${note}
+        <form id="af">${field('a-pw', 'New password (8+ characters)', 'password', 'new-password', 'minlength="8" required')}${field('a-pw2', 'Confirm password', 'password', 'new-password', 'required')}
+        <p class="auth-err" id="a-err" role="alert"></p><button class="btn" type="submit">Save password</button></form>`,
+      setup: `<h2>Accounts aren't set up yet</h2>
+        <p class="hint">Sign-in needs the app's Supabase settings in <b>config.js</b> (see the README). Until then you can use Plate on this phone only.</p>
+        <button class="btn" id="a-local">Use on this phone only</button>`,
+    };
+    v.innerHTML = `<div class="auth">${head}<div class="card auth-card">${forms[mode]}</div></div>`;
+    $$('[data-m]', v).forEach((a) => a.onclick = (e) => { e.preventDefault(); showAuth(a.dataset.m); });
+    const lb = $('#a-local', v); if (lb) lb.onclick = () => enterApp(null);
+    const form = $('#af', v); if (!form) return;
+    const err = (m) => { $('#a-err').textContent = m || ''; };
+    const btn = $('button[type=submit]', form);
+    setTimeout(() => { const f = $('input', form); if (f && window.innerWidth > 700) f.focus(); }, 50);
+    form.onsubmit = async (e) => {
+      e.preventDefault(); err('');
+      const email = ($('#a-email') || {}).value ? $('#a-email').value.trim() : '';
+      const pw = ($('#a-pw') || {}).value || '', pw2 = ($('#a-pw2') || {}).value;
+      if ((mode === 'signup' || mode === 'newpass') && pw.length < 8) return err('Use at least 8 characters.');
+      if ((mode === 'signup' || mode === 'newpass') && pw !== pw2) return err("Passwords don't match.");
+      btn.disabled = true; const label = btn.textContent; btn.innerHTML = '<span class="spin"></span>' + label;
+      try {
+        if (mode === 'signin') { const u = await remote.signIn(email, pw); return enterApp(u); }
+        if (mode === 'signup') {
+          const r = await remote.signUp(email, pw);
+          if (r.hasSession) return enterApp(r.user);
+          return showAuth('signin', `Almost done — we sent a confirmation link to <b>${esc(email)}</b>. Tap it, then sign in here. (Check spam if it doesn't arrive in a few minutes.)`);
+        }
+        if (mode === 'forgot') { await remote.resetPassword(email); return showAuth('signin', `If <b>${esc(email)}</b> has an account, a reset link is on its way. Open it on this phone.`); }
+        if (mode === 'newpass') {
+          await remote.setPassword(pw);
+          history.replaceState(history.state, '', appUrl());
+          toast('Password updated');
+          return enterApp(await remote.getUser());
+        }
+      } catch (ex) { err(authError(ex)); }
+      finally { if (btn.isConnected) { btn.disabled = false; btn.textContent = label; } }
+    };
+  }
+
+  function openPasswordSheet() {
+    openSheet((el) => {
+      el.innerHTML = `<div class="grab"></div>${sheetHead('Change password')}
+        <label class="f"><span>New password (8+ characters)</span><input type="password" id="np1" autocomplete="new-password"></label>
+        <label class="f"><span>Confirm password</span><input type="password" id="np2" autocomplete="new-password"></label>
+        <p class="auth-err" id="np-err"></p><button class="btn" id="np-save">Save password</button>`;
+      wireClose(el);
+      $('#np-save', el).onclick = async () => {
+        const a = $('#np1', el).value, b = $('#np2', el).value, er = $('#np-err', el);
+        if (a.length < 8) return er.textContent = 'Use at least 8 characters.';
+        if (a !== b) return er.textContent = "Passwords don't match.";
+        try { await remote.setPassword(a); await closeSheets(1); toast('Password updated'); }
+        catch (e) { er.textContent = authError(e); }
+      };
+    });
+  }
+
+  async function signOut() {
+    if (meta.dirty.length) await Sync.run();
+    if (meta.dirty.length && !confirm(`${meta.dirty.length} change(s) haven't reached your account yet (you may be offline). Sign out anyway and lose them?`)) return;
+    if (!confirm('Sign out? Your log stays safe in your account; it is removed from this phone until you sign in again.')) return;
+    try { await remote.signOut(); } catch (e) { /* signing out locally is enough */ }
+    await DB.clear();
+    location.replace(appUrl());
+  }
+
+  /* When someone signs in, make sure this phone's stored data belongs to them. */
+  async function claimLocalData(u) {
+    await loadMeta();
+    if (meta.owner && meta.owner !== 'local' && meta.owner !== u.id) {
+      await DB.clear(); meta = freshMeta();               // a different person's data was here: start clean
+    } else if (meta.owner !== u.id) {
+      // Data logged before accounts existed (v1 / phone-only mode): upload it to this account.
+      // Timestamp 1 means anything already in the account takes priority over it.
+      const keys = (await DB.keys()).filter(isDataKey);
+      keys.forEach((k) => { if (!meta.updated[k]) meta.updated[k] = 1; if (!meta.dirty.includes(k)) meta.dirty.push(k); });
+      meta.cursor = null;
+    }
+    meta.owner = u.id; meta.email = u.email || meta.email; await saveMeta();
+  }
+
+  let appStarted = false;
+  async function enterApp(u) {
+    user = u ? { id: u.id, email: u.email } : null;
+    try {
+      if (user) await claimLocalData(user);
+      else { await loadMeta(); if (!meta.owner) { meta.owner = 'local'; await saveMeta(); } }
+      await loadState();
+    } catch (e) { console.error(e); toast('Storage unavailable — is private browsing on?', 5000); }
+    document.body.classList.remove('auth-mode'); document.body.classList.add('in-app');
+    S.tab = 'diary'; S.date = today();
+    render();
+    if (user) Sync.run();
+    if (!appStarted) {
+      appStarted = true;
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState !== 'visible' || !document.body.classList.contains('in-app')) return;
+        if (S.tab === 'diary' && !sheets.length) renderDiary();
+        Sync.run(); // pick up changes made on the other device
+      });
+      window.addEventListener('online', () => Sync.run());
     }
   }
 
   /* ================= Boot ================= */
   async function boot() {
-    try { await loadState(); } catch (e) { console.error(e); toast('Storage unavailable — is private browsing on?', 5000); }
     history.replaceState({ depth: 0 }, '');
-    render();
     if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
     if ('serviceWorker' in navigator && window.isSecureContext) {
       navigator.serviceWorker.register('sw.js').catch((e) => console.warn('SW', e));
     }
-    // New day while the app sat open in the background
-    document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'visible' && S.tab === 'diary' && !sheets.length) renderDiary();
+    if (!remote) {
+      await loadMeta();
+      // No cloud configured: phone-only mode (skip the screen for people already using it)
+      if (meta.owner === 'local' || (await DB.keys()).some(isDataKey)) return enterApp(null);
+      return showAuth('setup');
+    }
+    remote.onAuth((ev) => {
+      if (ev === 'PASSWORD_RECOVERY') showAuth('newpass');
+      if (ev === 'SIGNED_OUT' && user) location.replace(appUrl());
     });
+    let u = null;
+    try { u = await remote.getUser(); }
+    catch (e) {
+      // Can't reach the server (e.g. no signal): open the signed-in person's log from this phone anyway.
+      console.warn(e);
+      await loadMeta();
+      if (meta.owner && meta.owner !== 'local' && !recoveryInUrl) return enterApp({ id: meta.owner, email: meta.email || '' });
+    }
+    if (recoveryInUrl) return showAuth('newpass');
+    if (u) {
+      if (location.hash.includes('access_token')) history.replaceState({ depth: 0 }, '', appUrl());
+      return enterApp(u);
+    }
+    showAuth('signin');
   }
-  window.__plate = { S, C, DB, makePDF, buildReport }; // for debugging
+  window.__plate = { S, C, DB, makePDF, buildReport, Sync, get meta() { return meta; } }; // for debugging
   boot();
 })();

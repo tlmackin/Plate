@@ -1,35 +1,58 @@
-PLATE — private food & macro log (v1.0.0)
-==========================================
+PLATE — food & macro log (v1.1, with accounts)
+================================================
 
-PUT IT ONLINE (Netlify, free, ~5 minutes)
-1. Unzip plate-app.zip on your computer. You get a folder named "plate" with index.html inside.
-2. Go to https://app.netlify.com/drop and create a free account (sign up with email or GitHub).
-3. Drag the "plate" FOLDER (not the zip, not the files inside) onto the drop area.
-4. In ~20 seconds Netlify gives you a link like https://random-name-123.netlify.app
-5. Optional: Site configuration > Change site name to get a nicer link, e.g. https://mackin-plate.netlify.app
-6. Important: claim/keep the site under your account (if you dropped it before signing in,
-   Netlify gives you about an hour to claim it, or it's deleted).
+WHAT'S NEW IN 1.1
+- Sign-in screen with email + password, like MyFitnessPal. Each person has their own private account.
+- Your log is saved to your account and synced, so it survives a lost phone and you can sign in on
+  any device. It still works with no signal and syncs when you're back online.
+- A log you already started in v1 is uploaded to your account the first time you sign in.
+
+ONE-TIME CLOUD SETUP (about 10 minutes, free)
+1. Go to https://supabase.com, click "Start your project" and sign in with your GitHub account.
+2. New project: name it "plate", create a database password (save it somewhere; the app doesn't
+   need it), pick region "East US", then create the project and wait about 2 minutes for it to start.
+3. Left menu > SQL Editor > New query. Open supabase-setup.sql from this folder, copy ALL of it,
+   paste it in and click Run. You should see "Success. No rows returned".
+4. Left menu > Authentication > URL Configuration:
+     Site URL:       https://tlmackin.github.io/plate/
+     Redirect URLs:  add https://tlmackin.github.io/plate/
+   (This is where the "confirm your email" and "reset password" links send you.)
+5. Click "Connect" at the top of the dashboard (or Project Settings > API Keys / Data API) and copy:
+     - the Project URL         (looks like https://abcdefghij.supabase.co)
+     - the anon / publishable key  (starts with "eyJ..." or "sb_publishable_...")
+   Do NOT use the "service_role" or "secret" key — that one must never go in the app.
+6. Open config.js in this folder and paste them between the quotes:
+     supabaseUrl: 'https://abcdefghij.supabase.co',
+     supabaseAnonKey: 'eyJ...',
+   Publishing these two values is normal and safe; the database rules from step 3 keep each
+   person's log private.
+7. Copy all of these files into your GitHub Desktop folder (replace the old ones), commit and push.
+8. On each phone, open the app, tap "Create an account", then tap the link in the confirmation email.
+   Use a different email for each person.
+9. Once you both have accounts: Authentication > Sign In / Providers > turn OFF
+   "Allow new users to sign up". Then strangers who find the link can't create accounts.
+
+GOOD TO KNOW
+- Free Supabase projects pause after about a week with no activity. Daily logging keeps it active.
+  If it ever pauses, Supabase emails you; click Restore in the dashboard. Your data is kept.
+- The built-in email sender only allows a few emails per hour, which is plenty for two people.
+  If a confirmation email doesn't arrive, check spam and wait a few minutes before trying again.
+- Signing out removes the log from that phone (it stays in the account). Signing in again brings it back.
+- Settings > Download backup still gives you your own copy as a file anytime.
+- Testing on a Netlify preview link: sign-in works there too. For email links to open the preview,
+  add  https://*--YOUR-NETLIFY-SITE.netlify.app/**  to Redirect URLs in step 4.
 
 INSTALL ON EACH PHONE
-iPhone:  open the link in Safari > Share button > "Add to Home Screen" > Add.
-Android: open the link in Chrome > ⋮ menu > "Add to Home screen" / "Install app".
-Open it from the home-screen icon (not the browser) from then on, and allow camera access
-the first time you scan.
-
-PRIVACY
-Each phone keeps its own log on the phone itself. Nothing is uploaded and there are no accounts,
-so you and your wife share the same link but never see each other's data.
-Use Settings > Back up now and then — a lost or reset phone means a lost log otherwise.
-
-FIRST-TIME SETUP (each phone)
-- Settings > Daily targets, your name (shown on reports).
-- Optional but recommended: a free USDA key (Settings has the link). Without it, whole-food search
-  is limited to a few dozen searches per hour for everyone using the demo key.
+iPhone:  open the link in Safari > Share > "Add to Home Screen".
+Android: open the link in Chrome > ⋮ menu > "Install app".
 
 WEEKLY REPORT
-Report tab > pick the week > "PDF report" or "Spreadsheet (CSV)" > share sheet.
-Save it to Files (or send it to yourself), then attach it in Nourish the way your dietitian prefers.
+Report tab > pick the week > "PDF report" or "Spreadsheet (CSV)" > share sheet > save or send,
+then attach it in Nourish the way your dietitian prefers.
 
-UPDATING THE APP LATER
-In Netlify open your site > Deploys > drag the new "plate" folder onto the deploy area.
-Same link, logs on the phones are untouched. Close and reopen the app to load the new version.
+FILES
+index.html, app.js, core.js, styles.css  the app
+config.js                                your Supabase settings (step 6)
+supabase-setup.sql                       database setup (step 3), not used by the app itself
+sw.js, manifest.webmanifest, icons/      what makes it installable and work offline
+lib/                                     barcode scanner, PDF maker, Supabase client
