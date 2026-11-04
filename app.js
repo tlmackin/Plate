@@ -1,0 +1,880 @@
+/* Plate — a private macro tracker. All data stays on this device (IndexedDB). */
+(function () {
+  'use strict';
+  const C = window.Core;
+  const { r1, num, MEALS } = C;
+  const VERSION = '1.0.0';
+  const $ = (s, el = document) => el.querySelector(s);
+  const $$ = (s, el = document) => [...el.querySelectorAll(s)];
+  const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const today = () => C.ymd(new Date());
+  const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+
+  /* ================= Storage (IndexedDB key/value) ================= */
+  const DB = (() => {
+    let dbp;
+    const open = () => dbp || (dbp = new Promise((res, rej) => {
+      const rq = indexedDB.open('plate', 1);
+      rq.onupgradeneeded = () => rq.result.createObjectStore('kv');
+      rq.onsuccess = () => res(rq.result);
+      rq.onerror = () => rej(rq.error);
+    }));
+    const tx = async (mode, fn) => {
+      const db = await open();
+      return new Promise((res, rej) => {
+        const t = db.transaction('kv', mode); const st = t.objectStore('kv');
+        const out = fn(st);
+        t.oncomplete = () => res(out && 'result' in out ? out.result : undefined);
+        t.onerror = () => rej(t.error);
+      });
+    };
+    return {
+      get: (k) => tx('readonly', (s) => s.get(k)),
+      set: (k, v) => tx('readwrite', (s) => s.put(v, k)),
+      del: (k) => tx('readwrite', (s) => s.delete(k)),
+      keys: () => tx('readonly', (s) => s.getAllKeys()),
+      clear: () => tx('readwrite', (s) => s.clear()),
+    };
+  })();
+
+  /* ================= State ================= */
+  const S = {
+    tab: 'diary',
+    date: today(),
+    repStart: C.weekStart(today()),
+    settings: { name: '', targets: { kcal: 2000, p: 150, c: 200, f: 65 }, usdaKey: '' },
+    myFoods: [], favs: [], recents: [], meals: [],
+    days: new Map(),
+  };
+  async function loadState() {
+    const [settings, myFoods, favs, recents, meals] = await Promise.all(['settings', 'myFoods', 'favs', 'recents', 'meals'].map((k) => DB.get(k)));
+    if (settings) S.settings = Object.assign(S.settings, settings, { targets: Object.assign({}, S.settings.targets, settings.targets) });
+    S.myFoods = myFoods || []; S.favs = favs || []; S.recents = recents || []; S.meals = meals || [];
+  }
+  const save = (k) => DB.set(k, S[k]);
+  async function getDay(date) {
+    if (!S.days.has(date)) S.days.set(date, (await DB.get('day:' + date)) || []);
+    return S.days.get(date);
+  }
+  async function setDay(date, entries) { S.days.set(date, entries); await DB.set('day:' + date, entries); }
+
+  function touchRecent(food) {
+    S.recents = [food, ...S.recents.filter((f) => f.key !== food.key)].slice(0, 60);
+    save('recents');
+  }
+  const isFav = (key) => S.favs.some((f) => f.key === key);
+  function toggleFav(food) {
+    if (isFav(food.key)) S.favs = S.favs.filter((f) => f.key !== food.key);
+    else S.favs = [food, ...S.favs];
+    save('favs');
+    return isFav(food.key);
+  }
+
+  /* ================= UI helpers ================= */
+  let toastT;
+  function toast(msg, ms = 2200) {
+    const t = $('#toast'); t.textContent = msg; t.classList.add('show');
+    clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('show'), ms);
+  }
+  function defaultMeal() {
+    const h = new Date().getHours();
+    return h < 10 ? 'Breakfast' : h < 14 ? 'Lunch' : h < 17 ? 'Snacks' : h < 21 ? 'Dinner' : 'Snacks';
+  }
+  function prettyDate(d) {
+    const t = today();
+    if (d === t) return 'Today';
+    if (d === C.addDays(t, -1)) return 'Yesterday';
+    if (d === C.addDays(t, 1)) return 'Tomorrow';
+    return C.parseYmd(d).toLocaleDateString('en-US', { weekday: 'long' });
+  }
+  const longDate = (d) => C.parseYmd(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  const shortDate = (d) => C.parseYmd(d).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+  const macroLine = (n) => `<span class="macros-mini"><i class="mp">P</i> ${r1(n.p)} · <i class="mc">C</i> ${r1(n.c)} · <i class="mf">F</i> ${r1(n.f)}</span>`;
+  const srcBadge = (f) => f.source === 'usda' ? '<span class="badge">USDA</span>' : f.source === 'custom' ? '<span class="badge">Mine</span>' : '';
+  const ICON = {
+    left: '<svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg>',
+    right: '<svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>',
+    close: '<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>',
+    scan: '<svg viewBox="0 0 24 24"><path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3M7 9v6M10 9v6M13 9v6M17 9v6"/></svg>',
+    search: '<svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5"/></svg>',
+    star: '<svg viewBox="0 0 24 24"><path d="M12 3l2.6 5.6 6 .7-4.5 4.1 1.2 6L12 16.4 6.7 19.4l1.2-6L3.4 9.3l6-.7z"/></svg>',
+  };
+
+  /* ---- Sheets (stacked, Android back button closes them) ---- */
+  const sheets = [];
+  let popWaiters = [];
+  function openSheet(build, opts = {}) {
+    const root = $('#sheet-root');
+    const bg = document.createElement('div'); bg.className = 'sheet-bg';
+    const el = document.createElement('div'); el.className = 'sheet' + (opts.full ? ' full' : '');
+    el.setAttribute('role', 'dialog');
+    bg.style.zIndex = 20 + sheets.length * 2; el.style.zIndex = 21 + sheets.length * 2;
+    root.append(bg, el);
+    const s = { el, bg, onClose: opts.onClose };
+    sheets.push(s);
+    history.pushState({ depth: sheets.length }, '');
+    bg.addEventListener('click', () => closeSheets(1));
+    document.body.style.overflow = 'hidden';
+    build(el, s);
+    return s;
+  }
+  function removeTop() {
+    const s = sheets.pop(); if (!s) return;
+    s.el.remove(); s.bg.remove();
+    try { s.onClose && s.onClose(); } catch (e) { console.error(e); }
+    if (!sheets.length) document.body.style.overflow = '';
+  }
+  function closeSheets(n = 1) {
+    n = Math.min(n, sheets.length);
+    if (!n) return Promise.resolve();
+    const target = sheets.length - n;
+    return new Promise((res) => {
+      const w = { target, res, done: false };
+      popWaiters.push(w);
+      history.go(-n);
+      setTimeout(() => { // safety net in case popstate never fires
+        if (w.done) return;
+        while (sheets.length > target) removeTop();
+        flushWaiters();
+      }, 600);
+    });
+  }
+  function flushWaiters() {
+    popWaiters = popWaiters.filter((w) => { if (sheets.length <= w.target) { w.done = true; w.res(); return false; } return true; });
+  }
+  window.addEventListener('popstate', (e) => {
+    const depth = (e.state && e.state.depth) || 0;
+    while (sheets.length > depth) removeTop();
+    flushWaiters();
+  });
+  const closeAll = () => closeSheets(sheets.length);
+  const sheetHead = (title, sub) => `<div class="sheet-head"><h3>${esc(title)}${sub ? `<span class="brand">${esc(sub)}</span>` : ''}</h3><button class="iconbtn" data-close aria-label="Close">${ICON.close}</button></div>`;
+  function wireClose(el) { $$('[data-close]', el).forEach((b) => b.addEventListener('click', () => closeSheets(1))); }
+
+  /* ================= Tabs ================= */
+  $$('.tab').forEach((b) => b.addEventListener('click', () => {
+    const t = b.dataset.tab;
+    if (t === 'add') { openAdd({ meal: S.tab === 'diary' ? defaultMeal() : defaultMeal(), date: S.tab === 'diary' ? S.date : today() }); return; }
+    S.tab = t; render();
+  }));
+  function render() {
+    $$('.tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === S.tab));
+    window.scrollTo(0, 0);
+    ({ diary: renderDiary, foods: renderFoods, report: renderReport, settings: renderSettings })[S.tab]();
+  }
+
+  /* ================= Diary ================= */
+  async function renderDiary() {
+    const d = S.date;
+    $('#topbar').innerHTML = `
+      <div class="datenav">
+        <button class="iconbtn" id="dprev" aria-label="Previous day">${ICON.left}</button>
+        <div class="datebtn">${esc(prettyDate(d))}<small>${esc(longDate(d))}</small><input type="date" id="dpick" value="${d}" aria-label="Pick a date"></div>
+        <button class="iconbtn" id="dnext" aria-label="Next day">${ICON.right}</button>
+      </div>`;
+    $('#dprev').onclick = () => { S.date = C.addDays(S.date, -1); renderDiary(); };
+    $('#dnext').onclick = () => { S.date = C.addDays(S.date, 1); renderDiary(); };
+    $('#dpick').onchange = (e) => { if (e.target.value) { S.date = e.target.value; renderDiary(); } };
+
+    const entries = await getDay(d);
+    if (d !== S.date || S.tab !== 'diary') return;
+    const tot = C.sumEntries(entries), T = S.settings.targets;
+    const left = (T.kcal || 0) - tot.kcal;
+    const pct = T.kcal ? Math.min(1, tot.kcal / T.kcal) : 0;
+    const CIRC = 2 * Math.PI * 48;
+    const bar = (cls, name, val, tgt) => {
+      const p = tgt ? Math.min(100, (val / tgt) * 100) : 0;
+      return `<div class="bar ${cls}"><div class="top"><b>${name}</b><span class="num">${Math.round(val)} / ${tgt || '—'} g</span></div>
+        <div class="trk"><div class="fill ${tgt && val > tgt ? 'over' : ''}" style="width:${p}%"></div></div></div>`;
+    };
+    let html = `<section class="card summary">
+      <div class="ring"><svg viewBox="0 0 116 116"><circle class="trk" cx="58" cy="58" r="48" fill="none"/>
+        <circle class="val ${left < 0 ? 'over' : ''}" cx="58" cy="58" r="48" fill="none" stroke-linecap="round" stroke-dasharray="${CIRC}" stroke-dashoffset="${CIRC * (1 - pct)}"/></svg>
+        <div class="lbl"><b class="num">${Math.abs(Math.round(left))}</b><span>${left < 0 ? 'kcal over' : 'kcal left'}</span><span class="num">${Math.round(tot.kcal)} / ${T.kcal || '—'}</span></div></div>
+      <div class="bars">${bar('p', 'Protein', tot.p, T.p)}${bar('c', 'Carbs', tot.c, T.c)}${bar('f', 'Fat', tot.f, T.f)}</div>
+    </section>`;
+    MEALS.forEach((m) => {
+      const list = entries.filter((e) => e.meal === m);
+      const mt = C.sumEntries(list);
+      html += `<section class="card"><div class="meal-head"><h2>${m}</h2>${list.length ? `<span class="small muted">${macroLine(mt)}</span><span class="k num">${Math.round(mt.kcal)}</span>` : ''}</div>`;
+      html += list.length ? list.map((e) => {
+        const n = C.entryNut(e);
+        return `<button class="item" data-entry="${e.id}"><div class="main"><div class="name">${esc(e.food.name)}</div>
+          <div class="sub">${esc(C.amountLabel(e))}${e.food.brand ? ' · ' + esc(e.food.brand) : ''}</div></div>
+          <div class="k num">${Math.round(n.kcal)}<small>${macroLine(n)}</small></div></button>`;
+      }).join('') : `<div class="empty">Nothing logged</div>`;
+      html += `<div class="meal-actions"><button class="chipbtn" data-add="${m}">+ Add food</button>${list.length ? `<button class="chipbtn ghost" data-savemeal="${m}">Save as meal</button>` : ''}</div></section>`;
+    });
+    if (!entries.length && !S.recents.length) {
+      html += `<div class="note">Tap <b>+</b> to search, scan a barcode, or create a food. Set your daily targets in <b>Settings</b>.</div>`;
+    }
+    $('#view').innerHTML = html;
+    $$('[data-add]').forEach((b) => b.onclick = () => openAdd({ meal: b.dataset.add, date: S.date }));
+    $$('[data-entry]').forEach((b) => b.onclick = () => {
+      const e = entries.find((x) => x.id === b.dataset.entry);
+      if (e) openFood(e.food, { mode: 'edit', entry: e, date: S.date });
+    });
+    $$('[data-savemeal]').forEach((b) => b.onclick = () => saveMealFrom(entries.filter((e) => e.meal === b.dataset.savemeal), b.dataset.savemeal));
+  }
+
+  async function addEntries(date, items) {
+    const entries = [...(await getDay(date))];
+    items.forEach((it) => {
+      entries.push({ id: uid(), meal: it.meal, food: it.food, unit: it.unit, qty: it.qty, t: Date.now() });
+      touchRecent(it.food);
+    });
+    await setDay(date, entries);
+  }
+
+  function saveMealFrom(list, mealName) {
+    openSheet((el) => {
+      el.innerHTML = `<div class="grab"></div>${sheetHead('Save as meal')}
+        <p class="hint">${list.length} item${list.length > 1 ? 's' : ''} · ${Math.round(C.sumEntries(list).kcal)} kcal. You can add the whole meal later in one tap.</p>
+        <label class="f"><span>Meal name</span><input type="text" id="mname" placeholder="e.g. Usual breakfast" value="${esc(mealName === 'Breakfast' ? 'My breakfast' : '')}"></label>
+        <button class="btn" id="msave">Save meal</button>`;
+      wireClose(el);
+      $('#mname', el).focus();
+      $('#msave', el).onclick = async () => {
+        const name = $('#mname', el).value.trim();
+        if (!name) { $('#mname', el).focus(); return; }
+        S.meals = [{ id: uid(), name, items: list.map((e) => ({ food: e.food, unit: e.unit, qty: e.qty })) }, ...S.meals];
+        await save('meals');
+        await closeSheets(1);
+        toast(`Saved “${name}”`);
+      };
+    });
+  }
+
+  /* ================= Food lookups ================= */
+  const cache = new Map();
+  async function getJSON(url, ms = 12000) {
+    const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), ms);
+    try {
+      const r = await fetch(url, { signal: ctl.signal });
+      if (!r.ok) { const err = new Error('HTTP ' + r.status); err.status = r.status; throw err; }
+      return await r.json();
+    } finally { clearTimeout(t); }
+  }
+  const OFF_FIELDS = 'code,product_name,product_name_en,generic_name,brands,nutriments,serving_size,serving_quantity';
+  async function offBarcode(code) {
+    for (const c of C.barcodeVariants(code)) {
+      const k = 'offb:' + c;
+      if (cache.has(k)) { if (cache.get(k)) return cache.get(k); continue; }
+      try {
+        const d = await getJSON(`https://world.openfoodfacts.org/api/v2/product/${c}.json?fields=${OFF_FIELDS}`);
+        const food = d && d.product ? C.fromOFF(Object.assign({ code: c }, d.product)) : null;
+        cache.set(k, food);
+        if (food) return food;
+      } catch (e) {
+        if (e.status === 404) { cache.set(k, null); continue; }
+        throw e;
+      }
+    }
+    return null;
+  }
+  async function offSearch(q) {
+    const k = 'offs:' + q.toLowerCase();
+    if (cache.has(k)) return cache.get(k);
+    let products;
+    try {
+      const d = await getJSON(`https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(q)}&search_simple=1&action=process&json=1&page_size=24&fields=${OFF_FIELDS}`, 15000);
+      products = d.products || [];
+    } catch (e) {
+      const d = await getJSON(`https://search.openfoodfacts.org/search?q=${encodeURIComponent(q)}&page_size=24&fields=${OFF_FIELDS}`, 15000);
+      products = d.hits || [];
+    }
+    const out = dedupe(products.map(C.fromOFF).filter((f) => f && f.name !== 'Unnamed product'));
+    cache.set(k, out);
+    return out;
+  }
+  async function usdaSearch(q) {
+    const k = 'usda:' + q.toLowerCase();
+    if (cache.has(k)) return cache.get(k);
+    const key = (S.settings.usdaKey || '').trim() || 'DEMO_KEY';
+    const d = await getJSON(`https://api.nal.usda.gov/fdc/v1/foods/search?api_key=${encodeURIComponent(key)}&query=${encodeURIComponent(q)}&dataType=${encodeURIComponent('Foundation,SR Legacy,Survey (FNDDS)')}&pageSize=25`, 15000);
+    const out = dedupe((d.foods || []).map(C.fromUSDA).filter(Boolean));
+    cache.set(k, out);
+    return out;
+  }
+  function dedupe(list) { const seen = new Set(); return list.filter((f) => !seen.has(f.key) && seen.add(f.key)); }
+  function errMsg(e, src) {
+    if (!navigator.onLine) return "You're offline — Recent, Favorites and My foods still work.";
+    if (e && e.status === 429) return src === 'usda' ? 'USDA search limit reached. Add your free USDA key in Settings for more searches.' : 'Open Food Facts is busy (rate limit). Try again in a minute.';
+    if (e && e.status === 403 && src === 'usda') return 'USDA rejected the API key. Check it in Settings.';
+    if (e && e.name === 'AbortError') return `${src === 'usda' ? 'USDA' : 'Open Food Facts'} took too long to respond. Try again.`;
+    return `Couldn't reach ${src === 'usda' ? 'USDA' : 'Open Food Facts'} right now.`;
+  }
+  const localByBarcode = (code) => {
+    const vs = C.barcodeVariants(code);
+    return S.myFoods.find((f) => f.barcode && vs.includes(f.barcode)) || null;
+  };
+
+  /* ================= Food rows ================= */
+  function foodRow(f, attrs = '') {
+    const u = f.units[f.defUnit || 0] || f.units[0];
+    const m = u.factor;
+    const n = { kcal: f.nut.kcal * m, p: f.nut.p * m, c: f.nut.c * m, f: f.nut.f * m };
+    return `<button class="item" ${attrs}><div class="main"><div class="name">${esc(f.name)}</div>
+      <div class="sub">${srcBadge(f)}${f.brand ? esc(f.brand) + ' · ' : ''}${esc(u.label)}</div></div>
+      <div class="k num">${Math.round(n.kcal)}<small>${macroLine(n)}</small></div></button>`;
+  }
+  function bindRows(el, list, onPick) {
+    $$('[data-i]', el).forEach((b) => b.addEventListener('click', () => onPick(list[+b.dataset.i])));
+  }
+  const listHTML = (list) => `<div class="list">${list.map((f, i) => foodRow(f, `data-i="${i}"`)).join('')}</div>`;
+
+  /* ================= Add sheet ================= */
+  function openAdd(ctx) {
+    let pane = S.recents.length ? 'recent' : 'search';
+    let lastQ = '';
+    openSheet((el) => {
+      el.innerHTML = `${sheetHead('Add food', `${ctx.meal} · ${shortDate(ctx.date)}`)}
+        <form class="searchbar" id="sform" role="search">
+          <input type="search" id="q" placeholder="Search foods or brands" enterkeyhint="search" autocomplete="off">
+          <button class="iconbtn" type="submit" aria-label="Search">${ICON.search}</button>
+          <button class="iconbtn scanbtn" type="button" id="scan" aria-label="Scan barcode">${ICON.scan}</button>
+        </form>
+        <div class="seg" id="seg">
+          ${[['search', 'Search'], ['recent', 'Recent'], ['favs', 'Favorites'], ['mine', 'My foods'], ['meals', 'Meals']].map(([k, l]) => `<button data-p="${k}">${l}</button>`).join('')}
+        </div>
+        <div id="pane"></div>`;
+      wireClose(el);
+      const paneEl = $('#pane', el);
+      const pick = (food) => openFood(food, { mode: 'add', meal: ctx.meal, date: ctx.date, onAdded: () => closeAll().then(afterAdd) });
+      const afterAdd = () => { if (S.tab === 'diary') { S.date = ctx.date; renderDiary(); } else toast('Added to ' + ctx.meal); };
+
+      function setPane(p) {
+        pane = p;
+        $$('#seg button', el).forEach((b) => b.classList.toggle('on', b.dataset.p === p));
+        if (p === 'search') return showSearch();
+        if (p === 'recent') return showList(S.recents, 'No recent foods yet. Foods you log show up here.');
+        if (p === 'favs') return showList(S.favs, 'Tap the ☆ on any food to keep it here.');
+        if (p === 'mine') {
+          paneEl.innerHTML = `<button class="btn secondary" id="newfood" style="margin-bottom:10px">+ Create a food</button>` +
+            (S.myFoods.length ? listHTML(S.myFoods) : `<div class="note">Foods you create are saved here for reuse.</div>`);
+          $('#newfood', paneEl).onclick = () => openFoodForm({ onSaved: pick });
+          bindRows(paneEl, S.myFoods, pick);
+          return;
+        }
+        if (p === 'meals') {
+          paneEl.innerHTML = S.meals.length ? `<div class="list">${S.meals.map((m, i) => mealRow(m, i)).join('')}</div>`
+            : `<div class="note">No saved meals yet. In your diary, tap <b>Save as meal</b> under any meal to reuse it.</div>`;
+          $$('[data-mi]', paneEl).forEach((b) => b.onclick = () => openMeal(S.meals[+b.dataset.mi], { meal: ctx.meal, date: ctx.date, onAdded: () => closeAll().then(afterAdd) }));
+        }
+      }
+      function showList(list, emptyMsg) {
+        paneEl.innerHTML = list.length ? listHTML(list) : `<div class="note">${emptyMsg}</div>`;
+        bindRows(paneEl, list, pick);
+      }
+      function showSearch() {
+        if (!lastQ) {
+          paneEl.innerHTML = `<div class="note">Search packaged foods (Open Food Facts) and whole foods (USDA) at the same time — e.g. “banana”, “chicken breast”, or “Chobani vanilla”.</div>`;
+          return;
+        }
+        runSearch(lastQ);
+      }
+      async function runSearch(q) {
+        const token = (runSearch.t = (runSearch.t || 0) + 1);
+        const digits = q.replace(/\s/g, '');
+        if (/^\d{8,14}$/.test(digits)) { paneEl.innerHTML = `<div class="note"><span class="spin"></span>Looking up barcode…</div>`; return lookupBarcode(digits, ctx, pick); }
+        const mine = S.myFoods.filter((f) => (f.name + ' ' + f.brand).toLowerCase().includes(q.toLowerCase()));
+        paneEl.innerHTML = `${mine.length ? `<div class="section-title">My foods</div><div id="r-mine"></div>` : ''}
+          <div class="section-title">Whole foods · USDA</div><div id="r-usda"><div class="note"><span class="spin"></span>Searching…</div></div>
+          <div class="section-title">Packaged · Open Food Facts</div><div id="r-off"><div class="note"><span class="spin"></span>Searching…</div></div>
+          <div style="margin-top:14px"><button class="btn secondary" id="notfound">Can't find it? Create a food</button></div>`;
+        if (mine.length) { $('#r-mine', paneEl).innerHTML = listHTML(mine); bindRows($('#r-mine', paneEl), mine, pick); }
+        $('#notfound', paneEl).onclick = () => openFoodForm({ preset: { name: q }, onSaved: pick });
+        const fill = (id, p, src) => p.then((list) => {
+          if (token !== runSearch.t) return;
+          const box = $(id, paneEl); if (!box) return;
+          box.innerHTML = list.length ? listHTML(list.slice(0, 20)) : `<div class="note">No matches.</div>`;
+          bindRows(box, list, pick);
+        }).catch((e) => {
+          if (token !== runSearch.t) return;
+          const box = $(id, paneEl); if (box) box.innerHTML = `<div class="note">${esc(errMsg(e, src))}</div>`;
+        });
+        fill('#r-usda', usdaSearch(q), 'usda');
+        fill('#r-off', offSearch(q), 'off');
+      }
+      $('#sform', el).onsubmit = (e) => {
+        e.preventDefault();
+        const q = $('#q', el).value.trim(); if (!q) return;
+        $('#q', el).blur();
+        lastQ = q; setPane('search');
+      };
+      $$('#seg button', el).forEach((b) => b.onclick = () => setPane(b.dataset.p));
+      $('#scan', el).onclick = () => openScanner((code) => lookupBarcode(code, ctx, pick));
+      setPane(pane);
+    }, { full: true });
+  }
+
+  async function lookupBarcode(code, ctx, pick) {
+    const local = localByBarcode(code);
+    if (local) return pick(local);
+    toast('Looking up ' + code + '…', 4000);
+    try {
+      const food = await offBarcode(code);
+      if (food) { $('#toast').classList.remove('show'); return pick(food); }
+      notFound(code, pick);
+    } catch (e) {
+      toast(errMsg(e, 'off'), 3500);
+      if (navigator.onLine) notFound(code, pick);
+    }
+  }
+  function notFound(code, pick) {
+    openSheet((el) => {
+      el.innerHTML = `<div class="grab"></div>${sheetHead('Not found')}
+        <p>Barcode <b class="num">${esc(code)}</b> isn't in Open Food Facts (or has no nutrition info).</p>
+        <p class="hint">Create it from the nutrition label — it's saved with this barcode, so next time the scan finds it instantly.</p>
+        <div class="btnrow"><button class="btn secondary" data-close>Cancel</button><button class="btn" id="mk">Create food</button></div>`;
+      wireClose(el);
+      $('#mk', el).onclick = async () => { await closeSheets(1); openFoodForm({ preset: { barcode: code }, onSaved: pick }); };
+    });
+  }
+
+  /* ================= Food detail (add / edit entry) ================= */
+  function openFood(food, opt) {
+    const editing = opt.mode === 'edit';
+    let unit = editing ? opt.entry.unit : (food.defUnit || 0);
+    let qty = editing ? opt.entry.qty : 1;
+    if (!editing && food.units[unit] && food.units[unit].label === 'g') qty = 100;
+    let meal = editing ? opt.entry.meal : (opt.meal || defaultMeal());
+    const date = opt.date || today();
+    openSheet((el) => {
+      const unitOpts = food.units.map((u, i) => `<option value="${i}" ${i === unit ? 'selected' : ''}>${esc(u.label)}</option>`).join('');
+      el.innerHTML = `<div class="grab"></div>
+        <div class="sheet-head"><h3>${esc(food.name)}<span class="brand">${srcBadge(food)}${esc(food.brand || (food.source === 'usda' ? 'USDA FoodData Central' : ''))}</span></h3>
+          <button class="star ${isFav(food.key) ? 'on' : ''}" id="fav" aria-label="Favorite">${ICON.star}</button>
+          <button class="iconbtn" data-close aria-label="Close">${ICON.close}</button></div>
+        <div class="nutgrid" id="ng"></div>
+        <div class="grid2">
+          <label class="f"><span>Amount</span><input type="text" inputmode="decimal" id="qty" value="${r1(qty)}"></label>
+          <label class="f"><span>Unit</span><select id="unit">${unitOpts}</select></label>
+        </div>
+        <label class="f"><span>Meal</span><select id="meal">${MEALS.map((m) => `<option ${m === meal ? 'selected' : ''}>${m}</option>`).join('')}</select></label>
+        ${editing ? `<div class="btnrow"><button class="btn danger" id="del">Remove</button><button class="btn" id="go">Save</button></div>`
+                  : `<button class="btn" id="go">Add to ${esc(shortDate(date))}</button>`}
+        ${food.source === 'custom' && !editing ? `<p style="text-align:center"><a href="#" id="editfood" class="small">Edit this food</a></p>` : ''}
+        <p class="small muted" style="text-align:center;margin-top:12px">${food.source === 'off' ? 'Nutrition data: Open Food Facts (ODbL) — check it against the label.' : food.source === 'usda' ? 'Nutrition data: USDA FoodData Central.' : ''}</p>`;
+      wireClose(el);
+      const upd = () => {
+        const n = C.entryNut({ food, unit, qty: num(qty) || 0 });
+        $('#ng', el).innerHTML = `<div><b class="num">${Math.round(n.kcal)}</b><span>kcal</span></div><div class="p"><b class="num">${r1(n.p)}</b><span>protein g</span></div>
+          <div class="c"><b class="num">${r1(n.c)}</b><span>carbs g</span></div><div class="f"><b class="num">${r1(n.f)}</b><span>fat g</span></div>`;
+      };
+      upd();
+      $('#qty', el).oninput = (e) => { qty = e.target.value; upd(); };
+      $('#qty', el).onfocus = (e) => e.target.select();
+      $('#unit', el).onchange = (e) => {
+        const prev = food.units[unit], next = food.units[+e.target.value];
+        unit = +e.target.value;
+        if (prev && next && (next.label === 'g' || prev.label === 'g')) { // keep the same amount of food when switching to/from grams
+          qty = r1(((num(qty) || 0) * prev.factor) / next.factor); $('#qty', el).value = qty;
+        }
+        upd();
+      };
+      $('#meal', el).onchange = (e) => { meal = e.target.value; };
+      $('#fav', el).onclick = () => { const on = toggleFav(food); $('#fav', el).classList.toggle('on', on); toast(on ? 'Added to favorites' : 'Removed from favorites'); };
+      $('#go', el).onclick = async () => {
+        const q = num(qty);
+        if (!q || q <= 0) { $('#qty', el).focus(); return toast('Enter an amount'); }
+        if (editing) {
+          const entries = (await getDay(date)).map((x) => x.id === opt.entry.id ? Object.assign({}, x, { unit, qty: q, meal }) : x);
+          await setDay(date, entries);
+          await closeSheets(1); renderDiary();
+        } else {
+          await addEntries(date, [{ food, unit, qty: q, meal }]);
+          if (opt.onAdded) opt.onAdded(); else { await closeSheets(1); toast(`Added to ${meal}`); if (S.tab === 'diary') renderDiary(); }
+        }
+      };
+      if (editing) $('#del', el).onclick = async () => {
+        await setDay(date, (await getDay(date)).filter((x) => x.id !== opt.entry.id));
+        await closeSheets(1); renderDiary(); toast('Removed');
+      };
+      const ef = $('#editfood', el);
+      if (ef) ef.onclick = async (e) => { e.preventDefault(); await closeSheets(1); openFoodForm({ food, onSaved: (f) => openFood(f, opt) }); };
+    });
+  }
+
+  /* ================= Manual food form ================= */
+  function openFoodForm({ food, preset = {}, onSaved }) {
+    const v = food ? Object.assign({ name: food.name, brand: food.brand, barcode: food.barcode }, food.form) : Object.assign({ servingLabel: '1 serving' }, preset);
+    openSheet((el) => {
+      el.innerHTML = `${sheetHead(food ? 'Edit food' : 'Create a food')}
+        <p class="hint">Copy the numbers from the nutrition label. Everything is per one serving.</p>
+        <label class="f"><span>Name *</span><input type="text" id="ff-name" value="${esc(v.name || '')}" placeholder="e.g. Grandma's chili"></label>
+        <label class="f"><span>Brand (optional)</span><input type="text" id="ff-brand" value="${esc(v.brand || '')}"></label>
+        <div class="grid2">
+          <label class="f"><span>Serving size</span><input type="text" id="ff-sl" value="${esc(v.servingLabel || '')}" placeholder="1 cup"></label>
+          <label class="f"><span>Grams per serving</span><input type="text" inputmode="decimal" id="ff-sg" value="${esc(v.servingGrams || '')}" placeholder="optional"></label>
+        </div>
+        <div class="grid4">
+          <label class="f"><span>Calories</span><input type="text" inputmode="decimal" id="ff-k" value="${esc(v.kcal != null ? v.kcal : '')}"></label>
+          <label class="f"><span>Protein g</span><input type="text" inputmode="decimal" id="ff-p" value="${esc(v.p != null ? v.p : '')}"></label>
+          <label class="f"><span>Carbs g</span><input type="text" inputmode="decimal" id="ff-c" value="${esc(v.c != null ? v.c : '')}"></label>
+          <label class="f"><span>Fat g</span><input type="text" inputmode="decimal" id="ff-f" value="${esc(v.f != null ? v.f : '')}"></label>
+        </div>
+        <p class="hint">Leave calories blank to calculate them from the macros. Add grams to log by weight too.</p>
+        <label class="f"><span>Barcode (optional)</span><input type="text" inputmode="numeric" id="ff-bc" value="${esc(v.barcode || '')}"></label>
+        <div class="btnrow">${food ? '<button class="btn danger" id="ff-del">Delete</button>' : ''}<button class="btn" id="ff-save">${food ? 'Save' : 'Save food'}</button></div>`;
+      wireClose(el);
+      if (!v.name) setTimeout(() => $('#ff-name', el).focus(), 250);
+      $('#ff-save', el).onclick = async () => {
+        const form = { name: $('#ff-name', el).value, brand: $('#ff-brand', el).value, servingLabel: $('#ff-sl', el).value, servingGrams: $('#ff-sg', el).value,
+          kcal: $('#ff-k', el).value, p: $('#ff-p', el).value, c: $('#ff-c', el).value, f: $('#ff-f', el).value, barcode: $('#ff-bc', el).value };
+        if (!form.name.trim()) { $('#ff-name', el).focus(); return toast('Give the food a name'); }
+        if (num(form.kcal) == null && ![form.p, form.c, form.f].some((x) => num(x) != null)) { $('#ff-k', el).focus(); return toast('Enter calories or macros'); }
+        const nf = C.fromManual(form, food && food.key);
+        S.myFoods = [nf, ...S.myFoods.filter((f) => f.key !== nf.key)].sort((a, b) => a.name.localeCompare(b.name));
+        await save('myFoods');
+        if (isFav(nf.key)) { S.favs = S.favs.map((f) => f.key === nf.key ? nf : f); save('favs'); }
+        if (S.recents.some((f) => f.key === nf.key)) { S.recents = S.recents.map((f) => f.key === nf.key ? nf : f); save('recents'); }
+        await closeSheets(1);
+        toast(food ? 'Food updated' : 'Food saved to My foods');
+        if (onSaved) onSaved(nf); else if (S.tab === 'foods') renderFoods();
+      };
+      const del = $('#ff-del', el);
+      if (del) del.onclick = async () => {
+        if (!confirm(`Delete “${food.name}” from My foods? Past diary entries are kept.`)) return;
+        S.myFoods = S.myFoods.filter((f) => f.key !== food.key);
+        S.favs = S.favs.filter((f) => f.key !== food.key);
+        S.recents = S.recents.filter((f) => f.key !== food.key);
+        await Promise.all([save('myFoods'), save('favs'), save('recents')]);
+        await closeSheets(1); toast('Deleted'); if (S.tab === 'foods') renderFoods();
+      };
+    });
+  }
+
+  /* ================= Saved meals ================= */
+  function mealRow(m, i) {
+    const t = C.sumEntries(m.items);
+    return `<button class="item" data-mi="${i}"><div class="main"><div class="name">${esc(m.name)}</div>
+      <div class="sub">${m.items.length} item${m.items.length > 1 ? 's' : ''} · ${esc(m.items.map((x) => x.food.name).join(', '))}</div></div>
+      <div class="k num">${Math.round(t.kcal)}<small>${macroLine(t)}</small></div></button>`;
+  }
+  function openMeal(m, opt) {
+    let meal = opt.meal || defaultMeal();
+    const date = opt.date || today();
+    openSheet((el) => {
+      const t = C.sumEntries(m.items);
+      el.innerHTML = `<div class="grab"></div>${sheetHead(m.name, 'Saved meal')}
+        <div class="nutgrid"><div><b class="num">${Math.round(t.kcal)}</b><span>kcal</span></div><div class="p"><b class="num">${r1(t.p)}</b><span>protein g</span></div>
+          <div class="c"><b class="num">${r1(t.c)}</b><span>carbs g</span></div><div class="f"><b class="num">${r1(t.f)}</b><span>fat g</span></div></div>
+        <div class="list" style="margin-bottom:14px">${m.items.map((x) => {
+          const n = C.entryNut(x);
+          return `<div class="item"><div class="main"><div class="name">${esc(x.food.name)}</div><div class="sub">${esc(C.amountLabel(x))}</div></div><div class="k num">${Math.round(n.kcal)}</div></div>`;
+        }).join('')}</div>
+        <label class="f"><span>Add to</span><select id="meal">${MEALS.map((x) => `<option ${x === meal ? 'selected' : ''}>${x}</option>`).join('')}</select></label>
+        <button class="btn" id="go">Add meal to ${esc(shortDate(date))}</button>
+        <div style="margin-top:10px"><button class="btn danger" id="del">Delete saved meal</button></div>
+        <p class="hint" style="margin-top:10px">After adding, tap any item in your diary to adjust its amount.</p>`;
+      wireClose(el);
+      $('#meal', el).onchange = (e) => { meal = e.target.value; };
+      $('#go', el).onclick = async () => {
+        await addEntries(date, m.items.map((x) => ({ food: x.food, unit: x.unit, qty: x.qty, meal })));
+        if (opt.onAdded) opt.onAdded(); else { await closeSheets(1); toast(`Added ${m.name}`); }
+      };
+      $('#del', el).onclick = async () => {
+        if (!confirm(`Delete saved meal “${m.name}”?`)) return;
+        S.meals = S.meals.filter((x) => x.id !== m.id); await save('meals');
+        await closeSheets(1); toast('Meal deleted'); if (S.tab === 'foods') renderFoods();
+      };
+    });
+  }
+
+  /* ================= Barcode scanner ================= */
+  function openScanner(onCode) {
+    let scanner = null, done = false;
+    const stop = async () => {
+      if (!scanner) return;
+      const s = scanner; scanner = null;
+      try { if (s.isScanning) await s.stop(); s.clear(); } catch (e) { /* already stopped */ }
+    };
+    openSheet((el) => {
+      el.innerHTML = `${sheetHead('Scan barcode')}
+        <div class="scanner"><div id="qr-reader"></div></div>
+        <p class="hint" style="margin-top:10px" id="scanmsg">Point the camera at the barcode and hold steady.</p>
+        <form id="manualbc" class="searchbar"><input type="text" inputmode="numeric" id="bc" placeholder="…or type the barcode number"><button class="iconbtn" type="submit" aria-label="Look up">${ICON.search}</button></form>`;
+      wireClose(el);
+      const finish = async (code) => {
+        if (done) return; done = true;
+        if (navigator.vibrate) navigator.vibrate(60);
+        await stop(); await closeSheets(1);
+        onCode(code);
+      };
+      $('#manualbc', el).onsubmit = (e) => {
+        e.preventDefault();
+        const code = $('#bc', el).value.replace(/\D/g, '');
+        if (code.length < 8) return toast('Barcodes are 8–14 digits');
+        finish(code);
+      };
+      if (!window.Html5Qrcode) { $('#scanmsg', el).textContent = 'Scanner is still loading — try again in a second.'; return; }
+      const F = window.Html5QrcodeSupportedFormats;
+      try {
+        scanner = new window.Html5Qrcode('qr-reader', {
+          verbose: false,
+          formatsToSupport: [F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E],
+          experimentalFeatures: { useBarCodeDetectorIfSupported: true },
+        });
+        scanner.start({ facingMode: 'environment' },
+          { fps: 12, qrbox: (w, h) => ({ width: Math.floor(w * 0.8), height: Math.floor(Math.min(h * 0.3, w * 0.45)) }) },
+          (text) => { const code = String(text).replace(/\D/g, ''); if (code.length >= 8) finish(code); },
+          () => {}
+        ).catch((err) => {
+          const m = String(err && (err.name || err.message || err));
+          $('#scanmsg', el).innerHTML = /NotAllowed|Permission/i.test(m)
+            ? 'Camera permission was blocked. Allow camera access for this site in your phone settings, or type the barcode below.'
+            : /secure|https/i.test(m) ? 'The camera only works when the app is opened over https (your Netlify link).' : 'Could not start the camera. You can type the barcode below.';
+        });
+      } catch (e) { $('#scanmsg', el).textContent = 'Could not start the camera. You can type the barcode below.'; }
+    }, { full: true, onClose: () => { stop(); } });
+  }
+
+  /* ================= Foods tab ================= */
+  let foodsPane = 'favs';
+  function renderFoods() {
+    $('#topbar').innerHTML = `<h1>Foods</h1>`;
+    const panes = [['favs', 'Favorites'], ['mine', 'My foods'], ['meals', 'Meals'], ['recent', 'Recent']];
+    let html = `<div class="seg">${panes.map(([k, l]) => `<button data-p="${k}" class="${k === foodsPane ? 'on' : ''}">${l}</button>`).join('')}</div><div id="fp"></div>`;
+    $('#view').innerHTML = html;
+    $$('.seg button').forEach((b) => b.onclick = () => { foodsPane = b.dataset.p; renderFoods(); });
+    const fp = $('#fp');
+    const pick = (f) => openFood(f, { mode: 'add', date: today(), meal: defaultMeal() });
+    if (foodsPane === 'favs') {
+      fp.innerHTML = S.favs.length ? listHTML(S.favs) : `<div class="note">No favorites yet. Open any food and tap ☆.</div>`;
+      bindRows(fp, S.favs, pick);
+    } else if (foodsPane === 'recent') {
+      fp.innerHTML = S.recents.length ? listHTML(S.recents) : `<div class="note">Foods you log show up here.</div>`;
+      bindRows(fp, S.recents, pick);
+    } else if (foodsPane === 'mine') {
+      fp.innerHTML = `<button class="btn" id="newfood" style="margin-bottom:12px">+ Create a food</button>` +
+        (S.myFoods.length ? `<div class="list">${S.myFoods.map((f, i) => foodRow(f, `data-i="${i}"`)).join('')}</div><p class="hint" style="margin-top:10px">Tap a food to edit or delete it.</p>` : `<div class="note">Foods you create (or that weren't in the databases) are saved here.</div>`);
+      $('#newfood').onclick = () => openFoodForm({});
+      bindRows(fp, S.myFoods, (f) => openFoodForm({ food: f }));
+    } else {
+      fp.innerHTML = S.meals.length ? `<div class="list">${S.meals.map((m, i) => mealRow(m, i)).join('')}</div>`
+        : `<div class="note">Log a meal in your diary, then tap <b>Save as meal</b> to reuse it in one tap.</div>`;
+      $$('[data-mi]', fp).forEach((b) => b.onclick = () => openMeal(S.meals[+b.dataset.mi], { date: today(), meal: defaultMeal() }));
+    }
+  }
+
+  /* ================= Report tab ================= */
+  async function buildReport() {
+    const days = C.weekDays(S.repStart);
+    await Promise.all(days.map(getDay));
+    return C.weekReport(days, (d) => S.days.get(d), S.settings.targets);
+  }
+  async function renderReport() {
+    $('#topbar').innerHTML = `<div class="datenav">
+      <button class="iconbtn" id="wprev" aria-label="Previous week">${ICON.left}</button>
+      <div class="datebtn">Week of ${esc(C.parseYmd(S.repStart).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }))}<small>${esc(longDate(S.repStart))} – ${esc(longDate(C.addDays(S.repStart, 6)))}</small></div>
+      <button class="iconbtn" id="wnext" aria-label="Next week">${ICON.right}</button></div>`;
+    $('#wprev').onclick = () => { S.repStart = C.addDays(S.repStart, -7); renderReport(); };
+    $('#wnext').onclick = () => { S.repStart = C.addDays(S.repStart, 7); renderReport(); };
+    const start = S.repStart;
+    const rep = await buildReport();
+    if (start !== S.repStart || S.tab !== 'report') return;
+    const T = rep.targets;
+    const cell = (v, t, dec) => `<td class="num ${t && v > t * 1.1 ? 'over-t' : ''}">${dec ? r1(v) : Math.round(v)}</td>`;
+    $('#view').innerHTML = `
+      <section class="card">
+        <table class="rep"><thead><tr><th>Day</th><th>kcal</th><th>Protein</th><th>Carbs</th><th>Fat</th></tr></thead><tbody>
+        ${rep.rows.map((r) => `<tr><td>${esc(C.parseYmd(r.date).toLocaleDateString('en-US', { weekday: 'short', month: 'numeric', day: 'numeric' }))}</td>
+          ${r.entries.length ? cell(r.tot.kcal, T.kcal) + cell(r.tot.p, 0) + cell(r.tot.c, T.c) + cell(r.tot.f, T.f) : '<td colspan="4" class="muted" style="text-align:right">not logged</td>'}</tr>`).join('')}
+        <tr class="avg"><td>Daily avg</td>${rep.daysLogged ? cell(rep.avg.kcal, 0) + cell(rep.avg.p, 0) + cell(rep.avg.c, 0) + cell(rep.avg.f, 0) : '<td colspan="4"></td>'}</tr>
+        <tr><td class="muted">Target</td><td class="num muted">${T.kcal || '—'}</td><td class="num muted">${T.p || '—'}</td><td class="num muted">${T.c || '—'}</td><td class="num muted">${T.f || '—'}</td></tr>
+        </tbody></table>
+        <p class="small muted" style="margin:10px 0 0">${rep.daysLogged} of 7 days logged. Protein, carbs and fat in grams.</p>
+      </section>
+      <section class="card">
+        <h2 style="margin-bottom:6px">Send to your dietitian</h2>
+        <p class="hint" style="margin:0 0 12px">Creates a file for this week. On your phone, the share sheet lets you save it to Files or send it — then attach it in Nourish however your dietitian prefers.</p>
+        <div class="btnrow"><button class="btn" id="pdf">PDF report</button><button class="btn secondary" id="csv">Spreadsheet (CSV)</button></div>
+        ${S.settings.name ? '' : `<p class="small muted" style="margin:10px 0 0">Tip: add your name in Settings so it appears on the report.</p>`}
+      </section>`;
+    $('#csv').onclick = async () => {
+      const r = await buildReport();
+      const blob = new Blob([C.reportCSV(r, S.settings.name)], { type: 'text/csv' });
+      shareFile(blob, fileBase(r) + '.csv', 'Weekly food log');
+    };
+    $('#pdf').onclick = async () => {
+      if (!window.jspdf) return toast('PDF tool still loading — try again');
+      const r = await buildReport();
+      shareFile(makePDF(r), fileBase(r) + '.pdf', 'Weekly food log');
+    };
+  }
+  const fileBase = (r) => `food-log${S.settings.name ? '-' + S.settings.name.trim().replace(/[^\w-]+/g, '-') : ''}-${r.rows[0].date}`;
+
+  function makePDF(rep) {
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({ unit: 'pt', format: 'letter' });
+    const W = doc.internal.pageSize.getWidth(), M = 40;
+    const green = [31, 61, 43];
+    const T = rep.targets;
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(18); doc.setTextColor(20);
+    doc.text('Weekly food log' + (S.settings.name ? ' — ' + S.settings.name : ''), M, 50);
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(11); doc.setTextColor(90);
+    doc.text(`${longDate(rep.rows[0].date)} – ${longDate(rep.rows[6].date)}   ·   ${rep.daysLogged} of 7 days logged`, M, 68);
+    doc.text(`Daily targets: ${T.kcal || '—'} kcal · Protein ${T.p || '—'} g · Carbs ${T.c || '—'} g · Fat ${T.f || '—'} g`, M, 84);
+    const fmt = (v, dec) => dec ? String(r1(v)) : String(Math.round(v));
+    doc.autoTable({
+      startY: 100, margin: { left: M, right: M }, theme: 'grid',
+      head: [['Day', 'Calories', 'Protein (g)', 'Carbs (g)', 'Fat (g)', 'Items']],
+      body: rep.rows.map((r) => r.entries.length
+        ? [shortDate(r.date), fmt(r.tot.kcal), fmt(r.tot.p, 1), fmt(r.tot.c, 1), fmt(r.tot.f, 1), r.entries.length]
+        : [shortDate(r.date), { content: 'not logged', colSpan: 5, styles: { textColor: 150, halign: 'center' } }]),
+      foot: [['Daily average', fmt(rep.avg.kcal), fmt(rep.avg.p, 1), fmt(rep.avg.c, 1), fmt(rep.avg.f, 1), ''],
+             ['Target', T.kcal || '—', T.p || '—', T.c || '—', T.f || '—', '']],
+      headStyles: { fillColor: green }, footStyles: { fillColor: [239, 235, 225], textColor: 20 },
+      styles: { fontSize: 10 }, didParseCell: (d) => { if (d.column.index >= 1 && d.cell.colSpan === 1) d.cell.styles.halign = 'right'; }, columnStyles: { 1: { halign: 'right' }, 2: { halign: 'right' }, 3: { halign: 'right' }, 4: { halign: 'right' }, 5: { halign: 'right' } },
+    });
+    rep.rows.filter((r) => r.entries.length).forEach((r) => {
+      let y = doc.lastAutoTable.finalY + 26;
+      if (y > doc.internal.pageSize.getHeight() - 120) { doc.addPage(); y = 50; }
+      doc.setFont('helvetica', 'bold'); doc.setFontSize(12); doc.setTextColor(20);
+      doc.text(C.parseYmd(r.date).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' }), M, y);
+      doc.setFont('helvetica', 'normal'); doc.setFontSize(10); doc.setTextColor(90);
+      doc.text(`${Math.round(r.tot.kcal)} kcal · P ${r1(r.tot.p)} g · C ${r1(r.tot.c)} g · F ${r1(r.tot.f)} g`, W - M, y, { align: 'right' });
+      const body = [];
+      MEALS.forEach((m) => {
+        const list = r.entries.filter((e) => e.meal === m);
+        if (!list.length) return;
+        const mt = C.sumEntries(list);
+        body.push([{ content: m, styles: { fontStyle: 'bold', fillColor: [246, 243, 236] } }, { content: '', styles: { fillColor: [246, 243, 236] } },
+          ...[fmt(mt.kcal), fmt(mt.p, 1), fmt(mt.c, 1), fmt(mt.f, 1)].map((v) => ({ content: v, styles: { fontStyle: 'bold', fillColor: [246, 243, 236] } }))]);
+        list.forEach((e) => {
+          const n = C.entryNut(e);
+          body.push(['   ' + e.food.name + (e.food.brand ? ` (${e.food.brand})` : ''), C.amountLabel(e), fmt(n.kcal), fmt(n.p, 1), fmt(n.c, 1), fmt(n.f, 1)]);
+        });
+      });
+      doc.autoTable({
+        startY: y + 8, margin: { left: M, right: M }, theme: 'plain',
+        head: [['Food', 'Amount', 'kcal', 'P', 'C', 'F']], body,
+        headStyles: { textColor: 100, fontStyle: 'bold', lineWidth: { bottom: 0.5 }, lineColor: 200 },
+        styles: { fontSize: 9, cellPadding: 3 }, didParseCell: (d) => { if (d.column.index >= 2) d.cell.styles.halign = 'right'; },
+        columnStyles: { 0: { cellWidth: 220 }, 2: { halign: 'right' }, 3: { halign: 'right' }, 4: { halign: 'right' }, 5: { halign: 'right' } },
+      });
+    });
+    const pages = doc.internal.getNumberOfPages();
+    for (let i = 1; i <= pages; i++) {
+      doc.setPage(i); doc.setFontSize(8); doc.setTextColor(140);
+      doc.text(`Nutrition data from Open Food Facts (ODbL), USDA FoodData Central and user-entered labels. Generated ${longDate(today())}.`, M, doc.internal.pageSize.getHeight() - 24);
+      doc.text(`Page ${i} of ${pages}`, W - M, doc.internal.pageSize.getHeight() - 24, { align: 'right' });
+    }
+    return doc.output('blob');
+  }
+
+  async function shareFile(blob, name, title) {
+    const file = new File([blob], name, { type: blob.type });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      try { await navigator.share({ files: [file], title }); return; }
+      catch (e) { if (e.name === 'AbortError') return; }
+    }
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+    toast('Saved ' + name);
+  }
+
+  /* ================= Settings ================= */
+  function renderSettings() {
+    $('#topbar').innerHTML = `<h1>Settings</h1>`;
+    const s = S.settings, T = s.targets;
+    $('#view').innerHTML = `
+      <section class="card">
+        <h2 style="margin-bottom:12px">Daily targets</h2>
+        <label class="f"><span>Calories (kcal)</span><input type="text" inputmode="numeric" id="t-k" value="${esc(T.kcal || '')}"></label>
+        <div class="grid2" style="grid-template-columns:repeat(3,1fr)">
+          <label class="f"><span>Protein g</span><input type="text" inputmode="numeric" id="t-p" value="${esc(T.p || '')}"></label>
+          <label class="f"><span>Carbs g</span><input type="text" inputmode="numeric" id="t-c" value="${esc(T.c || '')}"></label>
+          <label class="f"><span>Fat g</span><input type="text" inputmode="numeric" id="t-f" value="${esc(T.f || '')}"></label>
+        </div>
+        <p class="hint" id="t-hint"></p>
+        <button class="btn" id="t-save">Save targets</button>
+      </section>
+      <section class="card">
+        <h2 style="margin-bottom:12px">Report</h2>
+        <label class="f"><span>Your name (shown on reports)</span><input type="text" id="s-name" value="${esc(s.name)}" placeholder="e.g. Tim"></label>
+        <button class="btn secondary" id="s-namesave">Save name</button>
+      </section>
+      <section class="card">
+        <h2 style="margin-bottom:6px">USDA search key</h2>
+        <p class="hint" style="margin:0 0 10px">Whole-food search works without a key, but the shared demo key only allows a few dozen searches per hour. A free personal key (instant, by email) raises that to 1,000/hour. It's stored only on this phone.
+          <a href="https://fdc.nal.usda.gov/api-key-signup" target="_blank" rel="noopener">Get a free key</a></p>
+        <label class="f"><span>API key</span><input type="text" id="s-key" value="${esc(s.usdaKey)}" placeholder="DEMO_KEY" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+        <button class="btn secondary" id="s-keysave">Save key</button>
+      </section>
+      <section class="card">
+        <h2 style="margin-bottom:6px">Backup</h2>
+        <p class="hint" style="margin:0 0 10px">Your log lives only on this phone — nothing is uploaded. Make a backup now and then (e.g. save it to iCloud Drive or Google Drive) so a lost phone doesn't mean a lost log.</p>
+        <div class="btnrow"><button class="btn secondary" id="b-exp">Back up</button><button class="btn secondary" id="b-imp">Restore</button></div>
+        <input type="file" id="b-file" accept="application/json,.json" hidden>
+        <p class="small muted" id="persist" style="margin:10px 0 0"></p>
+      </section>
+      <section class="card small muted">
+        <p style="margin-top:0"><b>Plate</b> v${VERSION}. Food data from <a href="https://world.openfoodfacts.org" target="_blank" rel="noopener">Open Food Facts</a> (Open Database License) and <a href="https://fdc.nal.usda.gov" target="_blank" rel="noopener">USDA FoodData Central</a>. Community data can contain mistakes — compare with the label for foods you eat often.</p>
+        <button class="btn danger" id="wipe">Erase all data on this phone</button>
+      </section>`;
+    const hint = () => {
+      const p = num($('#t-p').value) || 0, c = num($('#t-c').value) || 0, f = num($('#t-f').value) || 0;
+      const k = Math.round(C.kcalFromMacros(p, c, f)), tk = num($('#t-k').value) || 0;
+      $('#t-hint').innerHTML = (p || c || f) ? `Your macros add up to <b>${k} kcal</b>${tk && Math.abs(k - tk) > 50 ? ` (target is ${tk}). <a href="#" id="t-use">Use ${k}</a>` : '.'}` : '';
+      const u = $('#t-use'); if (u) u.onclick = (e) => { e.preventDefault(); $('#t-k').value = k; hint(); };
+    };
+    ['#t-k', '#t-p', '#t-c', '#t-f'].forEach((id) => $(id).oninput = hint); hint();
+    $('#t-save').onclick = async () => {
+      s.targets = { kcal: num($('#t-k').value) || 0, p: num($('#t-p').value) || 0, c: num($('#t-c').value) || 0, f: num($('#t-f').value) || 0 };
+      await DB.set('settings', s); toast('Targets saved');
+    };
+    $('#s-namesave').onclick = async () => { s.name = $('#s-name').value.trim(); await DB.set('settings', s); toast('Saved'); };
+    $('#s-keysave').onclick = async () => { s.usdaKey = $('#s-key').value.trim(); cache.clear(); await DB.set('settings', s); toast('Key saved'); };
+    $('#b-exp').onclick = async () => {
+      const keys = await DB.keys(); const data = {};
+      for (const k of keys) data[k] = await DB.get(k);
+      const blob = new Blob([JSON.stringify({ app: 'plate', version: 1, exported: new Date().toISOString(), data })], { type: 'application/json' });
+      shareFile(blob, `plate-backup-${today()}.json`, 'Plate backup');
+    };
+    $('#b-imp').onclick = () => $('#b-file').click();
+    $('#b-file').onchange = async (e) => {
+      const f = e.target.files[0]; if (!f) return;
+      try {
+        const j = JSON.parse(await f.text());
+        if (j.app !== 'plate' || !j.data) throw new Error('bad');
+        if (!confirm('Replace everything on this phone with this backup?')) return;
+        await DB.clear();
+        for (const [k, v] of Object.entries(j.data)) await DB.set(k, v);
+        S.days.clear(); await loadState(); toast('Backup restored'); renderSettings();
+      } catch (err) { toast("That file isn't a Plate backup"); }
+      e.target.value = '';
+    };
+    $('#wipe').onclick = async () => {
+      if (!confirm('Erase your entire log, foods, meals and settings on this phone? This cannot be undone.')) return;
+      if (!confirm('Really erase everything? Consider making a backup first.')) return;
+      await DB.clear(); S.days.clear();
+      Object.assign(S, { myFoods: [], favs: [], recents: [], meals: [] });
+      S.settings = { name: '', targets: { kcal: 2000, p: 150, c: 200, f: 65 }, usdaKey: '' };
+      toast('Erased'); renderSettings();
+    };
+    if (navigator.storage && navigator.storage.persisted) {
+      navigator.storage.persisted().then((p) => { const el = $('#persist'); if (el) el.textContent = p ? 'Storage is protected from automatic cleanup.' : ''; });
+    }
+  }
+
+  /* ================= Boot ================= */
+  async function boot() {
+    try { await loadState(); } catch (e) { console.error(e); toast('Storage unavailable — is private browsing on?', 5000); }
+    history.replaceState({ depth: 0 }, '');
+    render();
+    if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+    if ('serviceWorker' in navigator && window.isSecureContext) {
+      navigator.serviceWorker.register('sw.js').catch((e) => console.warn('SW', e));
+    }
+    // New day while the app sat open in the background
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && S.tab === 'diary' && !sheets.length) renderDiary();
+    });
+  }
+  window.__plate = { S, C, DB, makePDF, buildReport }; // for debugging
+  boot();
+})();
