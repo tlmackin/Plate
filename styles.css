@@ -353,6 +353,79 @@ div.f { margin-bottom: 12px; }
 .lift-addset { margin: 3px 0 13px; min-height: 36px; }
 .lift-item-opts .f { margin-bottom: 0; }
 
+/* ---- Lift: "workout in progress" bar ---- */
+body.has-mini { padding-bottom: calc(var(--tabbar) + env(safe-area-inset-bottom) + 86px); }
+body.has-mini .toast { bottom: calc(var(--tabbar) + env(safe-area-inset-bottom) + 76px); }
+.lift-mini { position: fixed; left: 10px; right: 10px; bottom: calc(env(safe-area-inset-bottom) + var(--tabbar) + 16px); z-index: 9; max-width: 560px; margin: 0 auto; min-height: 48px; border: 0; border-radius: 16px; padding: 7px 14px; display: flex; align-items: center; gap: 10px; text-align: left; background: var(--grad); color: var(--on-grad); box-shadow: 0 8px 20px rgba(4, 120, 87, .32); }
+.lift-mini[hidden] { display: none; }
+.lift-mini-dot { width: 9px; height: 9px; border-radius: 50%; background: #d9f99d; flex: none; }
+.lift-mini-dot.paused { background: #fde68a; }
+.lift-mini-text { flex: 1; min-width: 0; font-size: 13px; line-height: 1.25; }
+.lift-mini-text b { display: block; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lift-mini-go { font-size: 14px; font-weight: 800; flex: none; }
+
+/* ---- Lift: workout tab ---- */
+.wk-continue { display: flex; align-items: center; gap: 10px; width: 100%; border: 0; text-align: left; background: color-mix(in srgb, var(--accent) 13%, var(--surface)); }
+.wk-continue .main { flex: 1; min-width: 0; display: grid; gap: 2px; }
+.wk-continue-go { color: var(--accent); font-weight: 800; flex: none; }
+.item:disabled { opacity: .55; }
+.item > .chipbtn { pointer-events: none; }
+.nutgrid b { overflow-wrap: anywhere; }
+.wk-grid3 { grid-template-columns: repeat(3, 1fr); }
+.wk-grid3 b { font-size: 17px; }
+
+/* ---- Lift: live workout ---- */
+.wk-sheet.sheet { padding-bottom: 0; display: flex; flex-direction: column; }
+.wk-top { position: sticky; top: calc(-8px - env(safe-area-inset-top)); z-index: 3; margin: 0 -16px 10px; padding: calc(env(safe-area-inset-top) + 8px) 16px 8px; background: var(--bg); border-bottom: 1px solid var(--line); }
+.wk-topline { display: flex; align-items: center; gap: 8px; }
+.wk-title { flex: 1; min-width: 0; }
+.wk-title input { font-weight: 800; font-size: 17px; padding: 8px 10px; background: transparent; border-color: transparent; text-overflow: ellipsis; }
+.wk-finish { width: auto; flex: none; padding: 10px 16px; font-size: 15px; }
+.wk-sub { display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 8px; margin-top: 6px; }
+.wk-sub b { font-size: 20px; font-weight: 800; letter-spacing: -.02em; }
+.wk-started { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 2px; }
+.wk-started .chipbtn { padding: 5px 12px; font-size: 13px; }
+#wk-body { flex: 1 0 auto; padding-bottom: 14px; }
+.wk-exname { border: 0; background: none; padding: 0; text-align: left; font-size: 16px; font-weight: 700; color: var(--accent); overflow-wrap: anywhere; }
+.wk-row { display: grid; gap: 5px; align-items: center; margin: 0 -6px 5px; padding: 3px 4px 3px 6px; border-radius: 12px; }
+.wk-row.f1 { grid-template-columns: 30px minmax(42px, .8fr) minmax(0, 1.2fr) 42px 22px; }
+.wk-row.f2 { grid-template-columns: 30px minmax(42px, .8fr) minmax(0, 1fr) minmax(0, 1fr) 42px 22px; }
+.wk-row.done { background: color-mix(in srgb, var(--accent) 15%, transparent); }
+.wk-head { font-size: 12px; font-weight: 700; color: var(--ink-3); margin-bottom: 1px; padding-top: 0; padding-bottom: 0; }
+.wk-type { position: relative; display: grid; place-items: center; height: 42px; border-radius: 10px; font-weight: 800; color: var(--ink-2); background: var(--surface-2); }
+.wk-type.marked { color: var(--amber); }
+.wk-type select { position: absolute; inset: 0; opacity: 0; padding: 0; border: 0; }
+.wk-prev { border: 0; background: none; padding: 0; min-height: 42px; font-size: 12.5px; font-weight: 600; color: var(--ink-2); line-height: 1.15; overflow-wrap: anywhere; word-spacing: 0; }
+.wk-prev:disabled { color: var(--ink-3); }
+.wk-in { display: block; min-width: 0; }
+.wk-in input { padding: 9px 6px; text-align: center; font-weight: 700; font-variant-numeric: tabular-nums; border-radius: 11px; }
+.wk-in input::placeholder { font-weight: 500; }
+.wk-row.done .wk-in input { background: transparent; border-color: transparent; }
+.wk-check { width: 42px; height: 42px; border: 0; border-radius: 12px; font-size: 18px; font-weight: 800; color: var(--ink-3); background: var(--surface-2); }
+.wk-check.on { background: var(--grad); color: var(--on-grad); }
+.wk-x { width: 22px; font-size: 18px; }
+.wk-exfoot { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 8px 0; }
+.wk-restpick { flex: 0 1 auto; min-width: 0; }
+.wk-restpick select { padding: 7px 8px; font-size: 16px; border-radius: 99px; color: var(--ink-2); }
+.wk-note { margin-bottom: 0; }
+.wk-note input { padding: 8px 12px; }
+.wk-restbar { position: sticky; bottom: 0; z-index: 3; margin: 0 -16px; padding: 8px 12px calc(8px + env(safe-area-inset-bottom)); display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 6px; background: var(--bg); border-top: 1px solid var(--line); }
+.wk-restlabel { margin-right: 2px; }
+.wk-restbtn { border: 0; min-height: 40px; min-width: 44px; padding: 6px 10px; border-radius: 12px; font-size: 14px; font-weight: 700; background: var(--surface-2); color: var(--ink); }
+.wk-resttime { font-size: 24px; font-weight: 800; min-width: 68px; text-align: center; color: var(--accent); letter-spacing: -.02em; }
+@media (max-width: 359px) { /* room for 137.5 on the smallest phones */
+  .wk-ex.card { padding: 12px 10px; }
+  .wk-row { gap: 4px; }
+  .wk-row.f1 { grid-template-columns: 26px 36px minmax(0, 1fr) 38px 16px; }
+  .wk-row.f2 { grid-template-columns: 26px 36px minmax(0, 1fr) minmax(0, 1fr) 38px 16px; }
+  .wk-prev { font-size: 11.5px; }
+  .wk-in input { padding: 9px 2px; letter-spacing: -.02em; }
+  .wk-check { width: 38px; }
+  .wk-x { width: 16px; }
+}
+.wk-sumex ol { margin: 8px 0 0; padding-left: 22px; }
+.wk-sumex p { margin: 8px 0 0; }
+
 /* ---- Sign-in screens ---- */
 body:not(.in-app) .tabs { display: none; }
 body.auth-mode { padding-bottom: env(safe-area-inset-bottom); }

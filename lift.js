@@ -2,28 +2,54 @@
    Saved in the same synced key/value store as the food log (see app.js), so offline use, sync,
    backup and "erase all my data" cover it automatically. Keys:
      wo:r:<id>     one routine (null once deleted, so the deletion reaches other devices)
-     wo:exercises  custom exercises     wo:favs  favorite exercise ids     wo:prefs  unit and default rest */
+     wo:s:<id>     one workout session (one record per workout, so saving again can't duplicate it)
+     wo:exercises  custom exercises     wo:favs  favorite exercise ids     wo:prefs  unit and default rest
+     _wo_rest      the running rest timer (this device only; keys starting with _ never sync) */
 (function () {
   'use strict';
   const L = window.LiftCore;
   const LIBRARY = window.PLATE_EXERCISES || [];
   const A = () => window.PlateApp; // filled in by app.js before it starts
   const ROUTINE_PREFIX = 'wo:r:';
-  const DEFAULT_PREFS = () => ({ unit: 'lb', rest: 90 });
+  const SESSION_PREFIX = 'wo:s:';
+  const DEFAULT_PREFS = () => ({ unit: 'lb', rest: 90, restAlert: true });
   const St = {
-    pane: 'routines',
-    routines: [], custom: [], favs: [], prefs: DEFAULT_PREFS(),
+    pane: 'workout',
+    routines: [], custom: [], favs: [], prefs: DEFAULT_PREFS(), sessions: [],
     filter: { q: '', muscle: '', equipment: '', level: '', scope: 'all' },
   };
+  /* The workout on screen. W.s is the working copy while its sheet is open. */
+  const W = { s: null, repaint: null, saveTimer: null, rest: null, ticker: null, finishing: false };
 
   async function load() {
     const { DB } = A();
-    const keys = (await DB.keys()).filter((k) => typeof k === 'string' && k.startsWith(ROUTINE_PREFIX));
-    const routines = await Promise.all(keys.map((k) => DB.get(k)));
+    if (!W.s) await recoverJournal();
+    const keys = (await DB.keys()).filter((k) => typeof k === 'string');
+    const routines = await Promise.all(keys.filter((k) => k.startsWith(ROUTINE_PREFIX)).map((k) => DB.get(k)));
+    const sessions = await Promise.all(keys.filter((k) => k.startsWith(SESSION_PREFIX)).map((k) => DB.get(k)));
     St.routines = routines.filter(Boolean).sort(byRoutineName);
     St.custom = (await DB.get('wo:exercises')) || [];
     St.favs = (await DB.get('wo:favs')) || [];
     St.prefs = Object.assign(DEFAULT_PREFS(), (await DB.get('wo:prefs')) || {});
+    St.sessions = sessions.filter((s) => s && s.status !== 'discarded').sort((a, b) => b.startedAt - a.startedAt);
+    W.rest = (await DB.get('_wo_rest')) || null;
+    reconcileOpenWorkout(sessions.filter(Boolean));
+    updateMini();
+  }
+  /* A sync brought in new data while a workout is on screen. Keep what's being typed, take newer changes
+     from another device otherwise, and leave the screen if the workout was ended over there. */
+  function reconcileOpenWorkout(docs) {
+    if (!W.s) return;
+    const incoming = docs.find((d) => d.id === W.s.id);
+    if (incoming && (incoming.status === 'completed' || incoming.status === 'discarded') && incoming.updatedAt > W.s.updatedAt) {
+      clearTimeout(W.saveTimer); W.saveTimer = null; W.s = null;
+      A().closeSheets(99);
+      A().toast('This workout was ended on another device');
+      return;
+    }
+    const typing = W.saveTimer || (document.activeElement && document.activeElement.closest && document.activeElement.matches('input, textarea, select') && document.activeElement.closest('.wk-sheet'));
+    if (incoming && incoming.updatedAt > W.s.updatedAt && !typing) { W.s = incoming; if (W.repaint) W.repaint(); }
+    St.sessions = [W.s, ...St.sessions.filter((x) => x.id !== W.s.id)].sort((a, b) => b.startedAt - a.startedAt);
   }
   const routineName = (r) => r.name || 'Untitled routine';
   const byRoutineName = (a, b) => routineName(a).localeCompare(routineName(b));
@@ -319,11 +345,19 @@
           ${draft.items.length ? `<p class="small muted" style="margin:0 2px 10px">${stats.exercises} exercise${stats.exercises === 1 ? '' : 's'} · ${stats.sets} set${stats.sets === 1 ? '' : 's'}</p>` : '<div class="note">Add the exercises for this routine. You can set targets and reorder them next.</div>'}
           ${draft.items.map((it, i) => itemHTML(it, i, draft.items.length)).join('')}
           <button class="btn secondary" id="rt-add" style="margin-bottom:12px">+ Add exercises</button>
-          <button class="btn" id="rt-done">Done</button>
+          ${draft.items.length ? '<button class="btn" id="rt-start" style="margin-bottom:10px">Start workout</button>' : ''}
+          <button class="btn ${draft.items.length ? 'secondary' : ''}" id="rt-done">Done</button>
           ${saved ? `<div class="btnrow" style="margin-top:10px"><button class="btn secondary" id="rt-dup">Duplicate</button><button class="btn danger" id="rt-del">Delete</button></div>` : ''}`;
         el.scrollTop = top;
         wireClose(el);
         $('#rt-done', el).onclick = () => closeSheets(1);
+        const startBtn = $('#rt-start', el);
+        if (startBtn) startBtn.onclick = async () => {
+          await persist();
+          const snapshot = JSON.parse(JSON.stringify(draft));
+          await closeSheets(1);
+          beginWorkout(snapshot);
+        };
         $('#rt-add', el).onclick = () => openPicker((list) => {
           list.forEach((ex) => draft.items.push(L.newItem(ex, St.prefs)));
           touched(); paint();
@@ -388,6 +422,386 @@
     });
   }
 
+  /* ================= Saving a workout ================= */
+  const unfinished = () => St.sessions.filter((s) => s.status === 'active' || s.status === 'paused');
+  const completed = () => St.sessions.filter((s) => s.status === 'completed');
+  /* The database write can be cancelled if the page closes in that instant, so every change first goes
+     to localStorage, which finishes immediately. It's only a safety copy: removed once the real save
+     lands, and picked up by recoverJournal if the page died first. */
+  const JOURNAL_KEY = 'plate_wo_journal';
+  function writeJournal(s) {
+    try { localStorage.setItem(JOURNAL_KEY, JSON.stringify({ owner: A().owner(), session: s })); } catch (e) { /* storage full or blocked: the normal save still runs */ }
+  }
+  function clearJournal() { try { localStorage.removeItem(JOURNAL_KEY); } catch (e) { /* nothing to clear */ } }
+  async function recoverJournal() {
+    let saved = null;
+    try { saved = JSON.parse(localStorage.getItem(JOURNAL_KEY)); } catch (e) { /* unreadable: ignore it */ }
+    clearJournal();
+    if (!saved || !saved.session || saved.owner !== A().owner()) return; // never hand one person's workout to another
+    const s = saved.session;
+    const stored = await A().DB.get(SESSION_PREFIX + s.id);
+    if (!stored || s.updatedAt > stored.updatedAt) await A().put(SESSION_PREFIX + s.id, s);
+  }
+  async function saveSession(s) {
+    s.updatedAt = Date.now();
+    writeJournal(s);
+    St.sessions = [s, ...St.sessions.filter((x) => x.id !== s.id)].sort((a, b) => b.startedAt - a.startedAt);
+    await A().put(SESSION_PREFIX + s.id, JSON.parse(JSON.stringify(s)));
+    if (!W.saveTimer) clearJournal(); // newer typing keeps its own safety copy until it saves
+  }
+  /* Typing saves after a short pause. A finished set or any other action saves straight away. */
+  function saveSoon() {
+    if (W.s) { W.s.updatedAt = Date.now(); writeJournal(W.s); }
+    clearTimeout(W.saveTimer);
+    W.saveTimer = setTimeout(() => { W.saveTimer = null; if (W.s) saveSession(W.s); }, 400);
+  }
+  async function flush() {
+    if (!W.saveTimer) return;
+    clearTimeout(W.saveTimer); W.saveTimer = null;
+    if (W.s) await saveSession(W.s);
+  }
+  const saveNow = () => { clearTimeout(W.saveTimer); W.saveTimer = null; return saveSession(W.s); };
+  window.addEventListener('pagehide', () => { flush(); });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') flush();
+    else if (W.s) keepScreenOn();
+  });
+
+  /* Keep the phone awake during a workout, where the browser allows it. */
+  let wakeLock = null;
+  async function keepScreenOn() {
+    try { if (navigator.wakeLock && !wakeLock) { wakeLock = await navigator.wakeLock.request('screen'); wakeLock.addEventListener('release', () => { wakeLock = null; }); } }
+    catch (e) { /* not available here: the workout still works */ }
+  }
+  function letScreenSleep() { if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; } }
+
+  /* ================= Rest timer ================= */
+  let audio = null;
+  function unlockAudio() { // browsers only allow sound after a tap, so this runs on the tap that starts the timer
+    if (!St.prefs.restAlert) return;
+    try { const Ctx = window.AudioContext || window.webkitAudioContext; if (Ctx) { audio = audio || new Ctx(); audio.resume(); } } catch (e) { audio = null; }
+  }
+  function restAlert() {
+    A().toast('Rest finished');
+    if (!St.prefs.restAlert) return;
+    try { if (navigator.vibrate) navigator.vibrate([180, 90, 180]); } catch (e) { /* not available */ }
+    try {
+      if (!audio) return;
+      [0, 0.25].forEach((at) => {
+        const osc = audio.createOscillator(), gain = audio.createGain();
+        osc.frequency.value = 880; gain.gain.value = 0.2;
+        osc.connect(gain); gain.connect(audio.destination);
+        osc.start(audio.currentTime + at); osc.stop(audio.currentTime + at + 0.16);
+      });
+    } catch (e) { /* no sound available */ }
+  }
+  const saveRest = () => { const { DB } = A(); return W.rest ? DB.set('_wo_rest', W.rest) : DB.del('_wo_rest'); };
+  function setRest(rest) { W.rest = rest; saveRest(); paintRest(); ensureTicker(); }
+  function restBarHTML() {
+    const { esc } = A();
+    if (!W.rest) {
+      return `<span class="small muted wk-restlabel">Rest</span>${L.REST_CHOICES.filter(Boolean).map((r) => `<button class="wk-restbtn" data-rest-start="${r}" aria-label="Start ${restLabel(r)} rest">${r < 60 ? r + 's' : r % 60 ? r + 's' : r / 60 + 'm'}</button>`).join('')}`;
+    }
+    const paused = W.rest.pausedLeft != null;
+    return `<button class="wk-restbtn" data-rest-add="-15" aria-label="15 seconds less">−15</button>
+      <b class="num wk-resttime" id="wk-resttime" role="timer">${esc(L.formatClock(L.restLeft(W.rest)))}</b>
+      <button class="wk-restbtn" data-rest-add="15" aria-label="15 seconds more">+15</button>
+      <button class="wk-restbtn" data-rest-toggle>${paused ? 'Resume' : 'Pause'}</button>
+      <button class="wk-restbtn" data-rest-skip>Skip</button>`;
+  }
+  function paintRest() { const bar = document.getElementById('wk-restbar'); if (bar) bar.innerHTML = restBarHTML(); }
+
+  /* One clock for everything that counts: the workout screen, the rest timer and the mini bar. */
+  function ensureTicker() {
+    const needed = W.s || W.rest || unfinished().length;
+    if (needed && !W.ticker) W.ticker = setInterval(tick, 1000);
+    if (!needed && W.ticker) { clearInterval(W.ticker); W.ticker = null; }
+  }
+  function tick() {
+    if (W.rest && W.rest.pausedLeft == null && L.restLeft(W.rest) <= 0) {
+      W.rest = null; saveRest(); paintRest();
+      if (document.visibilityState === 'visible') restAlert();
+    }
+    const time = document.getElementById('wk-resttime');
+    if (time && W.rest) time.textContent = L.formatClock(L.restLeft(W.rest));
+    const elapsed = document.getElementById('wk-elapsed');
+    if (elapsed && W.s) elapsed.textContent = L.formatClock(L.sessionDuration(W.s));
+    updateMini();
+    ensureTicker();
+  }
+
+  /* ================= "Workout in progress" bar, shown above the tabs on every screen ================= */
+  function updateMini() {
+    let bar = document.getElementById('lift-mini');
+    const s = unfinished()[0];
+    const show = !!s && !W.s;
+    document.body.classList.toggle('has-mini', show);
+    if (!show) { if (bar) bar.hidden = true; ensureTicker(); return; }
+    if (!bar) {
+      bar = document.createElement('button');
+      bar.id = 'lift-mini'; bar.className = 'lift-mini';
+      bar.addEventListener('click', () => { const x = unfinished()[0]; if (x) openWorkout(x); });
+      document.body.append(bar);
+    }
+    bar.hidden = false;
+    const { esc } = A();
+    const rest = W.rest ? ` · Rest ${L.formatClock(L.restLeft(W.rest))}` : '';
+    bar.innerHTML = `<span class="lift-mini-dot ${s.status === 'paused' ? 'paused' : ''}"></span><span class="lift-mini-text"><b>${esc(s.name)}</b>
+      <span class="num">${s.status === 'paused' ? 'Paused' : L.formatClock(L.sessionDuration(s))}${rest}</span></span><span class="lift-mini-go">Open</span>`;
+    ensureTicker();
+  }
+
+  /* ================= Live workout ================= */
+  const previousFor = (exId, s) => L.lastPerformance(St.sessions, exId, s.id);
+  function weightUnitOf(ex) { return (ex.sets[0] && ex.sets[0].u) || St.prefs.unit; }
+  function setTypeMark(set, ex) {
+    const type = L.SET_TYPES.find((t) => t.id === set.type);
+    if (type && type.mark) return type.mark;
+    let n = 0;
+    for (const x of ex.sets) { if (x.type !== 'warmup') n += 1; if (x.id === set.id) break; }
+    return String(n);
+  }
+  function workoutSetRow(ex, set, i, prev) {
+    const { esc } = A();
+    const fields = L.measureFields(ex.measure);
+    const prevSet = prev && prev.sets[i];
+    const hint = L.setHint(set, prevSet);
+    const prevText = prevSet ? L.formatSet(prevSet, ex.measure, true) : '–';
+    const input = (f) => `<label class="wk-in"><span class="lift-sr">${FIELD_INFO[f](ex)}, set ${i + 1}</span>
+      <input type="text" inputmode="${f === 'reps' ? 'numeric' : 'decimal'}" data-set="${esc(set.id)}" data-field="${f}" value="${set[f] == null ? '' : esc(set[f])}" placeholder="${hint[f] == null ? '–' : esc(hint[f])}"></label>`;
+    return `<div class="wk-row f${fields.length} ${set.done ? 'done' : ''}" data-row="${esc(set.id)}">
+      <label class="wk-type ${set.type !== 'normal' ? 'marked' : ''}"><span aria-hidden="true">${esc(setTypeMark(set, ex))}</span>
+        <select data-type="${esc(set.id)}" aria-label="Set ${i + 1} type">${L.SET_TYPES.map((t) => `<option value="${t.id}" ${t.id === set.type ? 'selected' : ''}>${t.label}</option>`).join('')}</select></label>
+      <button class="wk-prev num" data-use-prev="${esc(set.id)}" ${prevSet ? '' : 'disabled'} aria-label="${prevSet ? `Use last time's ${esc(L.formatSet(prevSet, ex.measure))}` : 'No previous set'}">${esc(prevText)}</button>
+      ${fields.map(input).join('')}
+      <button class="wk-check ${set.done ? 'on' : ''}" data-done="${esc(set.id)}" aria-pressed="${set.done}" aria-label="${set.done ? 'Undo' : 'Complete'} set ${i + 1}">✓</button>
+      <button class="lift-x wk-x" data-rmset="${esc(set.id)}" aria-label="Remove set ${i + 1}">×</button>
+    </div>`;
+  }
+  function workoutExerciseHTML(ex, i, count, s) {
+    const { esc, ICON } = A();
+    const prev = previousFor(ex.exId, s);
+    const fields = L.measureFields(ex.measure);
+    const when = prev ? new Date(prev.at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '';
+    return `<section class="card wk-ex" data-uid="${esc(ex.uid)}">
+      <div class="lift-item-head">
+        <div class="main"><button class="wk-exname" data-about="${esc(ex.exId)}">${esc(ex.name)}</button>
+          <div class="small muted">${prev ? `Last time ${esc(when)}` : 'First time logging this'}${ex.unilateral ? ' · each side' : ''}</div></div>
+        <button class="lift-move" data-move="-1" ${i === 0 ? 'disabled' : ''} aria-label="Move ${esc(ex.name)} up"><span class="up">${ICON.right}</span></button>
+        <button class="lift-move" data-move="1" ${i === count - 1 ? 'disabled' : ''} aria-label="Move ${esc(ex.name)} down"><span class="down">${ICON.right}</span></button>
+        <button class="lift-move" data-rmex aria-label="Remove ${esc(ex.name)}">${ICON.close}</button>
+      </div>
+      <div class="wk-row wk-head f${fields.length}" aria-hidden="true"><span>Set</span><span>Prev</span>${fields.map((f) => `<span>${f === 'w' ? `${FIELD_INFO.w(ex) === 'Weight' ? '' : FIELD_INFO.w(ex) + ' '}${esc(weightUnitOf(ex))}` : FIELD_INFO[f](ex)}</span>`).join('')}<span></span><span></span></div>
+      ${ex.sets.map((set, n) => workoutSetRow(ex, set, n, prev)).join('')}
+      <div class="wk-exfoot">
+        <button class="chipbtn" data-addset>+ Add set</button>
+        <label class="wk-restpick"><span class="lift-sr">Rest timer for ${esc(ex.name)}</span><select data-rest>${L.REST_CHOICES.map((r) => `<option value="${r}" ${r === ex.rest ? 'selected' : ''}>${r ? 'Rest ' + restLabel(r) : 'No timer'}</option>`).join('')}</select></label>
+      </div>
+      <label class="f wk-note"><span class="lift-sr">Note for ${esc(ex.name)}</span><input type="text" data-exnote value="${esc(ex.note)}" placeholder="Exercise note"></label>
+    </section>`;
+  }
+  function volumeText(kg) {
+    const v = Math.round(L.fromKg(kg, St.prefs.unit));
+    return `${v.toLocaleString('en-US')} ${St.prefs.unit}`;
+  }
+  function paintWorkoutStats() {
+    const el = document.getElementById('wk-stats');
+    if (!el || !W.s) return;
+    const st = L.sessionStats(W.s);
+    el.textContent = `${st.exercises} exercise${st.exercises === 1 ? '' : 's'} · ${st.done}/${st.sets} sets · ${volumeText(st.volumeKg)}`;
+  }
+  function openWorkout(session) {
+    const { openSheet, closeSheets, esc, $, ICON, toast } = A();
+    W.s = session;
+    W.finishing = false;
+    keepScreenOn();
+    updateMini();
+    openSheet((el) => {
+      el.classList.add('wk-sheet');
+      el.innerHTML = `<div class="wk-top">
+          <div class="wk-topline">
+            <button class="iconbtn" data-close aria-label="Minimize workout">${ICON.down}</button>
+            <div class="wk-title"><input type="text" id="wk-name" maxlength="60" aria-label="Workout name" value="${esc(session.name)}"></div>
+            <button class="btn wk-finish" id="wk-finish">Finish</button>
+          </div>
+          <div class="wk-sub"><b class="num" id="wk-elapsed">${L.formatClock(L.sessionDuration(session))}</b><span class="small muted" id="wk-stats"></span></div>
+          <div class="small muted wk-started"><span>Started ${esc(new Date(session.startedAt).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }))}</span><button class="chipbtn ghost" id="wk-pause"></button></div>
+        </div>
+        <div id="wk-body"></div>
+        <div class="wk-restbar" id="wk-restbar"></div>`;
+      A().wireClose(el);
+      const body = $('#wk-body', el);
+      const paint = () => {
+        const s = W.s; if (!s) return;
+        const top = el.scrollTop;
+        const n = s.exercises.length;
+        body.innerHTML = `${s.status === 'paused' ? '<div class="note">Paused. The clock has stopped, and you can still edit your sets.</div>' : ''}
+          ${n ? '' : '<div class="note">Add your first exercise to get going.</div>'}
+          ${s.exercises.map((ex, i) => workoutExerciseHTML(ex, i, n, s)).join('')}
+          <button class="btn secondary" id="wk-add" style="margin-bottom:12px">+ Add exercises</button>
+          <label class="f"><span>Workout notes</span><textarea id="wk-note" rows="2" placeholder="How did it go?">${esc(s.note)}</textarea></label>
+          <button class="btn danger" id="wk-discard">Discard workout</button>`;
+        el.scrollTop = top;
+        $('#wk-pause', el).textContent = s.status === 'paused' ? 'Resume' : 'Pause';
+        const name = $('#wk-name', el);
+        if (document.activeElement !== name) name.value = s.name;
+        paintWorkoutStats();
+        paintRest();
+      };
+      W.repaint = paint;
+      paint();
+      const exerciseOf = (node) => { const c = node.closest('[data-uid]'); return c ? W.s.exercises.find((x) => x.uid === c.dataset.uid) : null; };
+
+      el.addEventListener('input', (e) => {
+        const t = e.target; if (!W.s) return;
+        if (t.id === 'wk-name') { W.s.name = t.value.trim() || 'Workout'; return saveSoon(); }
+        if (t.id === 'wk-note') { W.s.note = t.value; return saveSoon(); }
+        const ex = exerciseOf(t); if (!ex) return;
+        if ('exnote' in t.dataset) { ex.note = t.value; return saveSoon(); }
+        if (t.dataset.field) {
+          const set = ex.sets.find((x) => x.id === t.dataset.set);
+          if (set) { set[t.dataset.field] = L.cleanNumber(t.value, t.dataset.field); paintWorkoutStats(); saveSoon(); }
+        }
+      });
+      el.addEventListener('change', (e) => {
+        const t = e.target; if (!W.s) return;
+        const ex = exerciseOf(t); if (!ex) return;
+        if ('rest' in t.dataset) { ex.rest = Number(t.value); saveNow(); }
+        else if (t.dataset.type) {
+          const set = ex.sets.find((x) => x.id === t.dataset.type);
+          if (set) { set.type = t.value; saveNow(); paint(); }
+        }
+      });
+      el.addEventListener('click', async (e) => {
+        const btn = e.target.closest('button'); if (!btn || btn.disabled || !W.s) return;
+        const d = btn.dataset;
+        /* rest timer */
+        if (d.restStart) { unlockAudio(); return setRest(L.startRest(Number(d.restStart))); }
+        if (d.restAdd && W.rest) { L.adjustRest(W.rest, Number(d.restAdd)); return setRest(W.rest); }
+        if ('restToggle' in d && W.rest) { unlockAudio(); if (W.rest.pausedLeft != null) L.resumeRest(W.rest); else L.pauseRest(W.rest); return setRest(W.rest); }
+        if ('restSkip' in d) return setRest(null);
+        /* whole workout */
+        if (btn.id === 'wk-pause') {
+          if (W.s.status === 'paused') L.resumeSession(W.s); else L.pauseSession(W.s);
+          paint();
+          $('#wk-elapsed', el).textContent = L.formatClock(L.sessionDuration(W.s));
+          return saveNow();
+        }
+        if (btn.id === 'wk-add') return openPicker((list) => {
+          list.forEach((x) => { const prev = previousFor(x.id, W.s); W.s.exercises.push(L.sessionExercise(x, St.prefs, prev ? prev.sets.length : 3)); });
+          saveNow(); paint();
+        });
+        if (btn.id === 'wk-finish') return finishWorkout();
+        if (btn.id === 'wk-discard') {
+          if (!confirm('Discard this workout? Everything you recorded in it will be lost.')) return;
+          clearTimeout(W.saveTimer); W.saveTimer = null;
+          const doc = L.discardedSession(W.s);
+          St.sessions = St.sessions.filter((x) => x.id !== W.s.id);
+          W.s = null;
+          setRest(null);
+          await A().put(SESSION_PREFIX + doc.id, doc);
+          await closeSheets(1);
+          return toast('Workout discarded');
+        }
+        /* one exercise */
+        const ex = exerciseOf(btn); if (!ex) return;
+        if (d.about) { const found = findExercise(d.about); if (found) openExercise(found); else toast("This exercise is no longer in your library"); return; }
+        const index = W.s.exercises.indexOf(ex);
+        if (d.move) L.moveItem(W.s.exercises, index, Number(d.move));
+        else if ('rmex' in d) {
+          if (ex.sets.some((x) => x.done) && !confirm(`Remove ${ex.name} and the sets you finished?`)) return;
+          W.s.exercises.splice(index, 1);
+        } else if ('addset' in d) L.addSessionSet(ex, St.prefs.unit);
+        else if (d.rmset) L.removeSessionSet(ex, d.rmset);
+        else if (d.usePrev) {
+          const set = ex.sets.find((x) => x.id === d.usePrev);
+          const prev = previousFor(ex.exId, W.s);
+          const prevSet = prev && prev.sets[ex.sets.indexOf(set)];
+          if (set && prevSet) { const h = L.setHint({ u: set.u, target: null }, prevSet); L.measureFields(ex.measure).forEach((f) => { set[f] = h[f]; }); }
+        } else if (d.done) {
+          const set = ex.sets.find((x) => x.id === d.done); if (!set) return;
+          if (set.done) { set.done = false; set.doneAt = null; }
+          else {
+            const prev = previousFor(ex.exId, W.s);
+            const hint = L.setHint(set, prev && prev.sets[ex.sets.indexOf(set)]);
+            const need = L.requiredField(ex.measure);
+            if (!L.completeSet(set, hint, ex.measure)) {
+              const box = el.querySelector(`[data-set="${set.id}"][data-field="${need}"]`);
+              if (box) box.focus();
+              return toast(`Enter ${FIELD_INFO[need](ex).toLowerCase()} first`);
+            }
+            if (ex.rest > 0) { unlockAudio(); setRest(L.startRest(ex.rest)); }
+          }
+        } else return;
+        paint(); // show it first, so a tap never feels slow, then save
+        await saveNow();
+      });
+    }, {
+      full: true,
+      onClose: async () => {
+        await flush();
+        W.s = null; W.repaint = null;
+        letScreenSleep();
+        updateMini();
+        repaintIfOnTab();
+      },
+    });
+  }
+  async function beginWorkout(routine) {
+    const open = unfinished()[0];
+    if (open) { A().toast('Finish or discard this workout before starting another'); return openWorkout(open); }
+    const s = L.newSession(routine, findExercise, St.prefs);
+    await saveSession(s);
+    openWorkout(s);
+  }
+  async function finishWorkout() {
+    if (W.finishing || !W.s) return; // a second tap can't save it twice
+    const st = L.sessionStats(W.s);
+    if (!st.done) {
+      A().toast('Complete at least one set, or discard this workout');
+      return;
+    }
+    if (st.done < st.sets && !confirm(`${st.sets - st.done} unfinished set${st.sets - st.done === 1 ? '' : 's'} won't be saved. Finish the workout?`)) return;
+    W.finishing = true;
+    clearTimeout(W.saveTimer); W.saveTimer = null;
+    const s = W.s;
+    L.finishSession(s);
+    W.s = null; // closing the sheet shouldn't save it again
+    setRest(null);
+    await saveSession(s);
+    await A().closeSheets(1);
+    openSummary(s, true);
+  }
+  function openSummary(s, justFinished) {
+    const { openSheet, sheetHead, wireClose, closeSheets, esc, $, put, toast } = A();
+    const st = L.sessionStats(s);
+    const date = new Date(s.startedAt).toLocaleString('en-US', { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+    openSheet((el) => {
+      el.innerHTML = `<div class="grab"></div>${sheetHead(justFinished ? 'Workout complete' : s.name, justFinished ? s.name : date)}
+        <div class="nutgrid wk-grid3"><div><b class="num">${esc(L.formatClock(L.sessionDuration(s)))}</b><span>time</span></div>
+          <div><b class="num">${st.done}</b><span>sets</span></div>
+          <div><b class="num">${esc(volumeText(st.volumeKg))}</b><span>volume</span></div></div>
+        ${s.exercises.map((ex) => `<section class="card wk-sumex"><h2>${esc(ex.name)}</h2><ol>${ex.sets.map((x) => {
+          const type = L.SET_TYPES.find((t) => t.id === x.type);
+          return `<li class="num">${esc(L.formatSet(x, ex.measure))}${x.type !== 'normal' && type ? ` <span class="badge">${esc(type.label)}</span>` : ''}</li>`;
+        }).join('')}</ol>${ex.note ? `<p class="small muted">${esc(ex.note)}</p>` : ''}</section>`).join('')}
+        ${s.note ? `<section class="card"><h2>Notes</h2><p class="lift-notes small">${esc(s.note)}</p></section>` : ''}
+        <p class="small muted" style="margin:0 2px 12px">Volume is weight × reps for finished sets, leaving out warm-ups, assisted, timed and distance sets.</p>
+        <button class="btn" id="sm-done">Done</button>
+        <div style="margin-top:10px"><button class="btn danger" id="sm-del">Delete workout</button></div>`;
+      wireClose(el);
+      $('#sm-done', el).onclick = () => closeSheets(1);
+      $('#sm-del', el).onclick = async () => {
+        if (!confirm('Delete this workout from your history? This cannot be undone.')) return;
+        const doc = L.discardedSession(s);
+        St.sessions = St.sessions.filter((x) => x.id !== s.id);
+        await put(SESSION_PREFIX + s.id, doc);
+        await closeSheets(1);
+        toast('Workout deleted');
+      };
+    }, { onClose: repaintIfOnTab });
+  }
+
   /* ================= Templates ================= */
   function openTemplate(t) {
     const { openSheet, sheetHead, wireClose, closeSheets, esc, $ } = A();
@@ -428,7 +842,8 @@
           <label class="f" style="margin:0"><span>Weight unit</span><select id="pf-unit"><option value="lb" ${St.prefs.unit === 'lb' ? 'selected' : ''}>Pounds (lb)</option><option value="kg" ${St.prefs.unit === 'kg' ? 'selected' : ''}>Kilograms (kg)</option></select></label>
           <label class="f" style="margin:0"><span>Default rest timer</span><select id="pf-rest">${L.REST_CHOICES.map((r) => `<option value="${r}" ${r === St.prefs.rest ? 'selected' : ''}>${restLabel(r)}</option>`).join('')}</select></label>
         </div>
-        <p class="hint" style="margin:10px 0 0">These apply to sets you add from now on. Targets you already entered keep their unit.</p>
+        <label class="lift-check-line" style="margin:12px 0 0"><input type="checkbox" id="pf-alert" ${St.prefs.restAlert ? 'checked' : ''}><span>Sound and vibration when rest ends</span></label>
+        <p class="hint" style="margin:10px 0 0">Units and rest time apply to sets you add from now on. Numbers you already entered keep their unit. The alert only plays while the app is open.</p>
       </section>`;
     $('#rt-new', root).onclick = () => openRoutine(L.newRoutine(''));
     $$('[data-routine]', root).forEach((b) => { b.onclick = () => openRoutine(St.routines.find((r) => r.id === b.dataset.routine), { existing: true }); });
@@ -436,6 +851,35 @@
     const savePrefs = async () => { await put('wo:prefs', St.prefs); toast('Saved'); };
     $('#pf-unit', root).onchange = (e) => { St.prefs.unit = e.target.value; savePrefs(); };
     $('#pf-rest', root).onchange = (e) => { St.prefs.rest = Number(e.target.value); savePrefs(); };
+    $('#pf-alert', root).onchange = (e) => { St.prefs.restAlert = e.target.checked; savePrefs(); };
+  }
+  function workoutPane(root) {
+    const { esc, $, $$, C } = A();
+    const now = new Date();
+    const from = C.parseYmd(C.weekStart(C.ymd(now))).getTime();
+    const week = L.periodSummary(St.sessions, from, C.parseYmd(C.addDays(C.ymd(new Date(from)), 7)).getTime());
+    const open = unfinished();
+    const recent = completed().slice(0, 5);
+    const minutes = Math.round(week.durationMs / 60000);
+    root.innerHTML = `${open.map((s) => `<button class="card wk-continue" data-open="${esc(s.id)}"><span class="main"><b>Continue ${esc(s.name)}</b>
+        <span class="small">${s.status === 'paused' ? 'Paused' : 'In progress'} · ${esc(L.formatClock(L.sessionDuration(s)))}</span></span><span class="wk-continue-go">Open</span></button>`).join('')}
+      <button class="btn" id="wk-empty" style="margin-bottom:12px">Start empty workout</button>
+      <div class="section-title">Start from a routine</div>
+      ${St.routines.length ? `<div class="list">${St.routines.map((r) => {
+        const st = L.routineStats(r);
+        return `<button class="item" data-start="${esc(r.id)}" ${st.exercises ? '' : 'disabled'}><div class="main"><div class="name">${esc(routineName(r))}</div><div class="sub">${st.exercises} exercise${st.exercises === 1 ? '' : 's'} · ${st.sets} set${st.sets === 1 ? '' : 's'}</div></div><span class="chipbtn">Start</span></button>`;
+      }).join('')}</div>` : '<div class="note">No routines yet. Build one in the Routines tab, or start an empty workout and add exercises as you go.</div>'}
+      <div class="section-title">This week</div>
+      <div class="nutgrid"><div><b class="num">${week.workouts}</b><span>workouts</span></div><div><b class="num">${minutes}</b><span>minutes</span></div>
+        <div><b class="num">${week.sets}</b><span>sets</span></div><div><b class="num">${Math.round(L.fromKg(week.volumeKg, St.prefs.unit)).toLocaleString('en-US')}</b><span>${esc(St.prefs.unit)} volume</span></div></div>
+      ${recent.length ? `<div class="section-title">Recent workouts</div><div class="list">${recent.map((s) => {
+        const st = L.sessionStats(s);
+        return `<button class="item" data-summary="${esc(s.id)}"><div class="main"><div class="name">${esc(s.name)}</div><div class="sub">${esc(new Date(s.startedAt).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }))} · ${st.done} set${st.done === 1 ? '' : 's'} · ${esc(L.formatClock(L.sessionDuration(s)))}</div></div></button>`;
+      }).join('')}</div>` : ''}`;
+    $('#wk-empty', root).onclick = () => beginWorkout(null);
+    $$('[data-open]', root).forEach((b) => { b.onclick = () => openWorkout(St.sessions.find((s) => s.id === b.dataset.open)); });
+    $$('[data-start]', root).forEach((b) => { b.onclick = () => beginWorkout(St.routines.find((r) => r.id === b.dataset.start)); });
+    $$('[data-summary]', root).forEach((b) => { b.onclick = () => openSummary(St.sessions.find((s) => s.id === b.dataset.summary)); });
   }
   function exercisesPane(root) {
     const { $, $$ } = A();
@@ -463,11 +907,11 @@
     const wasTyping = active && active.classList && active.classList.contains('lift-q');
     const caret = wasTyping ? active.selectionStart : 0;
     $('#topbar').innerHTML = '<h1>Lift</h1>';
-    $('#view').innerHTML = `<div class="seg lift-panes">${[['routines', 'Routines'], ['exercises', 'Exercises']].map(([k, t]) => `<button data-pane="${k}" class="${St.pane === k ? 'on' : ''}">${t}</button>`).join('')}</div><div id="lift-pane"></div>`;
+    $('#view').innerHTML = `<div class="seg lift-panes">${[['workout', 'Workout'], ['routines', 'Routines'], ['exercises', 'Exercises']].map(([k, t]) => `<button data-pane="${k}" class="${St.pane === k ? 'on' : ''}">${t}</button>`).join('')}</div><div id="lift-pane"></div>`;
     $$('[data-pane]').forEach((b) => { b.onclick = () => { St.pane = b.dataset.pane; render(); }; });
-    (St.pane === 'exercises' ? exercisesPane : routinesPane)($('#lift-pane'));
+    ({ workout: workoutPane, routines: routinesPane, exercises: exercisesPane })[St.pane]($('#lift-pane'));
     if (wasTyping) { const q = $('.lift-q'); if (q) { q.focus(); q.setSelectionRange(caret, caret); } } // a sync can repaint this tab mid-search
   }
 
-  window.PlateLift = { load, render };
+  window.PlateLift = { load, render, flush, hasOpenWorkout: () => unfinished().length > 0 };
 })();

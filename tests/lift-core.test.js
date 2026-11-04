@@ -174,6 +174,210 @@ test('routines: stats and whether one is worth saving', () => {
   assert.equal(L.routineHasContent(L.newRoutine('Legs')), true);
 });
 
+/* ---- Workouts ---- */
+const bench = () => byId('barbell-bench-press');
+function routineWithBench() {
+  const r = L.newRoutine('Push');
+  const it = L.newItem(bench(), { unit: 'lb', rest: 120 }, 2);
+  it.sets.forEach((s) => { s.w = 135; s.reps = 10; });
+  it.note = 'Pause';
+  r.items.push(it);
+  return r;
+}
+function doneSession(startedAt, sets, exId = 'barbell-bench-press') {
+  const s = L.newSession(null, null, {}, startedAt);
+  const ex = L.sessionExercise(byId(exId), { unit: 'lb' }, 0);
+  ex.sets = sets.map(([w, reps, type]) => Object.assign(L.newSessionSet('lb'), { w, reps, type: type || 'normal', done: true, doneAt: startedAt }));
+  s.exercises.push(ex);
+  return L.finishSession(s, startedAt + 3600000);
+}
+
+test('session: starting from a routine copies the plan into targets, leaving results blank', () => {
+  const s = L.newSession(routineWithBench(), byId, { unit: 'kg' }, 1000);
+  assert.deepEqual([s.status, s.name, s.startedAt], ['active', 'Push', 1000]);
+  const ex = s.exercises[0];
+  assert.deepEqual([ex.exId, ex.rest, ex.note, ex.equipment, ex.secondary.includes('triceps')], ['barbell-bench-press', 120, 'Pause', 'barbell', true]);
+  const set = ex.sets[0];
+  assert.deepEqual([set.w, set.reps, set.done, set.u, set.target.w, set.target.reps, set.target.u], [null, null, false, 'lb', 135, 10, 'lb']);
+});
+
+test('session: changing the routine later cannot change the session', () => {
+  const r = routineWithBench();
+  const s = L.newSession(r, byId, {});
+  r.items[0].sets[0].w = 999; r.items[0].name = 'Renamed'; r.name = 'Renamed';
+  assert.deepEqual([s.name, s.exercises[0].name, s.exercises[0].sets[0].target.w], ['Push', 'Barbell Bench Press', 135]);
+});
+
+test('session: an exercise missing from the library still starts', () => {
+  const r = L.newRoutine('X');
+  r.items.push(L.newItem({ id: 'custom:gone', name: 'Gone', primary: 'chest', measure: 'weight_reps' }, {}));
+  const s = L.newSession(r, () => undefined, {});
+  assert.deepEqual([s.exercises[0].name, s.exercises[0].secondary], ['Gone', []]);
+});
+
+test('previous: finds the latest finished performance, ignoring others', () => {
+  const old = doneSession(1000, [[100, 5]]);
+  const latest = doneSession(5000, [[110, 5], [115, 3]]);
+  const other = doneSession(9000, [[50, 5]], 'plank');
+  const active = L.newSession(routineWithBench(), byId, {}, 9500);
+  active.exercises[0].sets[0].done = true;
+  const p = L.lastPerformance([old, latest, other, active], 'barbell-bench-press');
+  assert.deepEqual([p.at, p.sets.map((x) => x.w)], [5000, [110, 115]]);
+  assert.equal(L.lastPerformance([old], 'squat'), null);
+  assert.equal(L.lastPerformance([latest], 'barbell-bench-press', latest.id), null);
+});
+
+test('hint: the plan wins over last time, field by field', () => {
+  const set = L.newSessionSet('lb', { w: null, u: 'lb', reps: 8, secs: null, dist: null });
+  const h = L.setHint(set, { w: 145, u: 'lb', reps: 5 });
+  assert.deepEqual([h.w, h.reps], [145, 8]);
+  assert.deepEqual(L.setHint(L.newSessionSet('lb'), null), { w: null, reps: null, secs: null, dist: null });
+});
+
+test('hint: a weight in another unit is converted, not relabeled', () => {
+  const h = L.setHint(L.newSessionSet('kg'), { w: 135, u: 'lb', reps: 10 });
+  assert.equal(h.w, 61.2);
+  const p = { w: 135, u: 'lb', reps: 10 };
+  L.setHint(L.newSessionSet('kg'), p);
+  assert.equal(p.w, 135, 'the old record is untouched');
+});
+
+test('complete: blanks fill from the hint, typed values win', () => {
+  const set = L.newSessionSet('lb');
+  set.w = 140;
+  assert.equal(L.completeSet(set, { w: 135, reps: 10 }, 'weight_reps', 42), true);
+  assert.deepEqual([set.w, set.reps, set.done, set.doneAt], [140, 10, true, 42]);
+});
+
+test('complete: refused without the required value, but weight is optional', () => {
+  const none = L.newSessionSet('lb');
+  assert.equal(L.completeSet(none, {}, 'weight_reps'), false);
+  assert.equal(none.done, false);
+  const band = L.newSessionSet('lb'); band.reps = 15;
+  assert.equal(L.completeSet(band, {}, 'weight_reps'), true);
+  const timed = L.newSessionSet('lb');
+  assert.equal(L.completeSet(timed, {}, 'time'), false);
+  timed.secs = 30;
+  assert.equal(L.completeSet(timed, {}, 'time'), true);
+  const carry = L.newSessionSet('lb'); carry.w = 50;
+  assert.equal(L.completeSet(carry, {}, 'weight_distance'), false);
+  carry.dist = 40;
+  assert.equal(L.completeSet(carry, {}, 'weight_distance'), true);
+  assert.deepEqual(['weight_reps', 'reps', 'assisted', 'time', 'distance', 'weight_distance'].map(L.requiredField), ['reps', 'reps', 'reps', 'secs', 'dist', 'dist']);
+});
+
+test('volume: only finished work sets with weight and reps count', () => {
+  const set = (o) => Object.assign(L.newSessionSet('lb'), { w: 100, reps: 10, done: true }, o);
+  const lb100x10 = 100 * 0.45359237 * 10;
+  assert.ok(Math.abs(L.setVolumeKg(set({}), 'weight_reps') - lb100x10) < 1e-9);
+  assert.ok(Math.abs(L.setVolumeKg(set({ type: 'drop' }), 'weight_reps') - lb100x10) < 1e-9);
+  assert.equal(L.setVolumeKg(set({ u: 'kg' }), 'weight_reps'), 1000);
+  assert.equal(L.setVolumeKg(set({ done: false }), 'weight_reps'), 0);
+  assert.equal(L.setVolumeKg(set({ type: 'warmup' }), 'weight_reps'), 0);
+  assert.equal(L.setVolumeKg(set({}), 'assisted'), 0);
+  assert.equal(L.setVolumeKg(set({}), 'time'), 0);
+  assert.equal(L.setVolumeKg(set({}), 'weight_distance'), 0);
+  assert.equal(L.setVolumeKg(set({ w: null }), 'reps'), 0);
+  assert.ok(L.setVolumeKg(set({ w: 25 }), 'reps') > 0, 'added weight counts');
+});
+
+test('stats: mixed units add up correctly', () => {
+  const s = doneSession(0, [[100, 10]]);
+  const ex = L.sessionExercise(bench(), { unit: 'kg' }, 1);
+  Object.assign(ex.sets[0], { w: 100, reps: 2, done: true });
+  s.exercises.push(ex);
+  const st = L.sessionStats(s);
+  assert.deepEqual([st.exercises, st.sets, st.done], [2, 2, 2]);
+  assert.ok(Math.abs(st.volumeKg - (453.59237 + 200)) < 1e-6);
+});
+
+test('duration: paused time is left out, and the clock stops while paused', () => {
+  const T = 1000000;
+  const s = L.newSession(null, null, {}, T);
+  assert.equal(L.sessionDuration(s, T + 60000), 60000);
+  L.pauseSession(s, T + 60000);
+  assert.equal(L.sessionDuration(s, T + 999999), 60000);
+  L.pauseSession(s, T + 70000);
+  assert.equal(s.pausedAt, T + 60000, 'pausing twice keeps the first time');
+  L.resumeSession(s, T + 120000);
+  assert.deepEqual([s.status, s.pausedMs, s.pausedAt], ['active', 60000, null]);
+  assert.equal(L.sessionDuration(s, T + 180000), 120000);
+  L.resumeSession(s, T + 200000);
+  assert.equal(s.pausedMs, 60000, 'resuming twice adds nothing');
+});
+
+test('finish: keeps finished sets only, and finishing twice changes nothing', () => {
+  const T = 1000000;
+  const s = L.newSession(routineWithBench(), byId, {}, T);
+  s.exercises.push(L.sessionExercise(byId('plank'), {}, 2));
+  s.exercises[0].sets[0].done = true;
+  L.pauseSession(s, T + 1000);
+  L.finishSession(s, T + 5000);
+  assert.deepEqual([s.status, s.endedAt, s.pausedMs, s.exercises.length, s.exercises[0].sets.length], ['completed', T + 5000, 4000, 1, 1]);
+  assert.equal(L.sessionDuration(s, T + 999999), 1000);
+  L.finishSession(s, T + 9000);
+  assert.equal(s.endedAt, T + 5000);
+});
+
+test('discard: leaves a marker with no workout data', () => {
+  const s = doneSession(1000, [[100, 5]]);
+  const d = L.discardedSession(s, 2000);
+  assert.deepEqual(d, { id: s.id, status: 'discarded', startedAt: 1000, discardedAt: 2000, updatedAt: 2000 });
+  assert.equal(L.lastPerformance([d], 'barbell-bench-press'), null);
+  assert.equal(L.periodSummary([d], 0, 9999).workouts, 0);
+});
+
+test('adding a set: starts from the last set, undone', () => {
+  const ex = L.sessionExercise(bench(), { unit: 'kg' }, 1);
+  Object.assign(ex.sets[0], { w: 60, reps: 5, done: true });
+  L.addSessionSet(ex, 'lb');
+  const added = ex.sets[1];
+  assert.deepEqual([added.w, added.reps, added.done, added.u, added.target.w, added.target.reps], [null, null, false, 'kg', 60, 5]);
+  assert.notEqual(added.id, ex.sets[0].id);
+  const empty = L.sessionExercise(bench(), {}, 1);
+  L.removeSessionSet(empty, empty.sets[0].id);
+  L.addSessionSet(empty, 'kg');
+  assert.equal(empty.sets[0].u, 'kg');
+});
+
+test('period summary: counts only finished workouts in range', () => {
+  const inside = doneSession(5000, [[100, 10]]);
+  const list = [doneSession(1000, [[100, 10]]), inside, doneSession(9000, [[100, 10]]), L.newSession(null, null, {}, 5000)];
+  const out = L.periodSummary(list, 2000, 9000);
+  assert.deepEqual([out.workouts, out.sets, out.durationMs], [1, 1, 3600000]);
+});
+
+test('format: sets read naturally for every kind of exercise', () => {
+  const f = (o, m, plain) => L.formatSet(Object.assign({ w: null, u: 'lb', reps: null, secs: null, dist: null }, o), m, plain);
+  assert.equal(f({ w: 135, reps: 10 }, 'weight_reps'), '135 lb × 10');
+  assert.equal(f({ w: 135, reps: 10 }, 'weight_reps', true), '135 × 10');
+  assert.equal(f({ reps: 12 }, 'reps'), '12 reps');
+  assert.equal(f({ reps: 12 }, 'reps', true), '12');
+  assert.equal(f({ w: 40, reps: 8 }, 'assisted'), '40 lb assist × 8');
+  assert.equal(f({ secs: 75 }, 'time'), '1:15');
+  assert.equal(f({ dist: 500 }, 'distance'), '500 m');
+  assert.equal(f({ w: 50, dist: 40 }, 'weight_distance'), '50 lb × 40 m');
+  assert.equal(L.formatClock(3725000), '1:02:05');
+  assert.equal(L.formatClock(-5), '0:00');
+});
+
+test('rest timer: counts from a fixed end time, and survives pausing', () => {
+  const T = 1000000;
+  const r = L.startRest(90, T);
+  assert.equal(L.restLeft(r, T + 30000), 60000);
+  assert.equal(L.restLeft(r, T + 500000), 0, 'never negative, however long the phone slept');
+  L.pauseRest(r, T + 30000);
+  assert.equal(L.restLeft(r, T + 500000), 60000);
+  L.adjustRest(r, 15, T + 500000);
+  assert.equal(L.restLeft(r, T + 500000), 75000);
+  L.resumeRest(r, T + 500000);
+  assert.equal(L.restLeft(r, T + 510000), 65000);
+  L.adjustRest(r, -15, T + 510000);
+  assert.equal(L.restLeft(r, T + 510000), 50000);
+  L.adjustRest(r, -999, T + 510000);
+  assert.equal(L.restLeft(r, T + 510000), 0);
+});
+
 test('routines: an item keeps working after its exercise is gone', () => {
   const it = L.newItem({ id: 'custom:x', name: 'Gone', primary: 'chest', measure: 'time' }, {});
   assert.deepEqual([it.name, it.primary, L.measureFields(it.measure)], ['Gone', 'chest', ['secs']]);

@@ -10,12 +10,15 @@ const { chromium } = require('playwright-core');
 const ROOT = path.join(__dirname, '..');
 const shots = process.argv[2];
 const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.woff2': 'font/woff2', '.webmanifest': 'application/json' };
+let serverDelayMs = 0; // simulates a weak signal
 const server = http.createServer((req, res) => {
   const p = decodeURIComponent(req.url.split('?')[0]);
   const file = path.join(ROOT, p === '/' ? 'index.html' : p);
   if (!file.startsWith(ROOT) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) { res.writeHead(404); return res.end(); }
-  res.writeHead(200, { 'Content-Type': TYPES[path.extname(file)] || 'application/octet-stream' });
-  fs.createReadStream(file).pipe(res);
+  setTimeout(() => {
+    res.writeHead(200, { 'Content-Type': TYPES[path.extname(file)] || 'application/octet-stream' });
+    fs.createReadStream(file).pipe(res);
+  }, serverDelayMs);
 });
 
 /* The fake account: one set of rows that any number of "devices" share. */
@@ -25,7 +28,7 @@ const remotePush = (rows) => { rows.forEach((r) => { clock += 1000; cloud.set(r.
 const remotePull = (since) => [...cloud.values()].filter((r) => !since || Date.parse(r.server_at) > Date.parse(since));
 const FAKE = () => {
   window.__PLATE_FAKE_REMOTE = {
-    getUser: async () => ({ id: 'user-1', email: 'test@example.com' }), onAuth() {},
+    getUser: () => (localStorage.getItem('hang') ? new Promise(() => {}) : Promise.resolve({ id: 'user-1', email: 'test@example.com' })), onAuth() {}, signOut: async () => {},
     push: (rows) => window.__remotePush(rows), pull: (since) => window.__remotePull(since),
     wipe: () => window.__remoteWipe(),
     friends: { myUsername: async () => 'tester', setUsername: async (u) => u, list: async () => [], request: async () => 'sent', accept: async () => {}, remove: async () => {}, day: async () => ({ entries: [], targets: {} }) },
@@ -40,7 +43,7 @@ async function step(name, fn) {
 }
 
 async function device(browser, base, opts = {}) {
-  const ctx = await browser.newContext({ viewport: opts.viewport || { width: 390, height: 780 }, colorScheme: opts.colorScheme || 'light', reducedMotion: 'reduce', serviceWorkers: 'block', hasTouch: true });
+  const ctx = await browser.newContext({ viewport: opts.viewport || { width: 390, height: 780 }, colorScheme: opts.colorScheme || 'light', reducedMotion: 'reduce', serviceWorkers: opts.sw ? 'allow' : 'block', hasTouch: true });
   await ctx.route(/supabase\.co|openfoodfacts|nal\.usda/, (r) => { ctx.__leaked = true; r.abort(); });
   await ctx.exposeFunction('__remotePush', remotePush);
   await ctx.exposeFunction('__remotePull', remotePull);
@@ -50,7 +53,8 @@ async function device(browser, base, opts = {}) {
   page.errors = [];
   page.on('pageerror', (e) => page.errors.push(e.message));
   page.on('console', (m) => { if (m.type() === 'error' && !/Failed to load resource/.test(m.text())) page.errors.push(m.text()); });
-  page.on('dialog', (d) => d.accept());
+  page.dialogs = [];
+  page.on('dialog', (d) => { page.dialogs.push(d.message()); d.accept(); });
   await page.goto(base);
   await page.waitForSelector('body.in-app');
   return page;
@@ -92,8 +96,16 @@ const topSheet = (page) => page.locator('.sheet').last();
     assert.ok(cloud.has('myFoods'));
   });
 
-  await step('Lift tab opens on routines with templates', async () => {
+  await step('Lift tab opens on Workout, with an empty week and no pretend history', async () => {
     await tab(a, 'lift');
+    await a.waitForSelector('#wk-empty');
+    assert.match((await a.textContent('.nutgrid')).replace(/\s+/g, ''), /0workouts0minutes0sets0lbvolume/);
+    assert.equal(await a.locator('[data-summary]').count(), 0);
+    await shot(a, '00-workout-empty');
+  });
+
+  await step('routines pane lists templates', async () => {
+    await a.click('[data-pane="routines"]');
     await a.waitForSelector('text=+ New routine');
     assert.equal(await a.locator('[data-template]').count(), 9);
     await shot(a, '01-routines');
@@ -211,6 +223,7 @@ const topSheet = (page) => page.locator('.sheet').last();
     await a.reload();
     await a.waitForSelector('body.in-app');
     await tab(a, 'lift');
+    await a.click('[data-pane="routines"]');
     await a.click('[data-routine]:has-text("Push Day")');
     const bench = a.locator('.lift-item', { hasText: 'Barbell Bench Press' });
     assert.equal(await bench.locator('[data-field="w"]').first().inputValue(), '135');
@@ -228,6 +241,7 @@ const topSheet = (page) => page.locator('.sheet').last();
     await a.reload();
     await a.waitForSelector('body.in-app');
     await tab(a, 'lift');
+    await a.click('[data-pane="routines"]');
     await a.waitForSelector('[data-routine]:has-text("Push Day A")');
   });
 
@@ -236,6 +250,7 @@ const topSheet = (page) => page.locator('.sheet').last();
     assert.equal(await synced(a), 0);
     b = await device(browser, base);
     await tab(b, 'lift');
+    await b.click('[data-pane="routines"]');
     await b.waitForSelector('[data-routine]:has-text("Push Day A")', { timeout: 5000 });
     await b.click('[data-pane="exercises"]');
     await b.fill('.lift-q', 'landmine');
@@ -314,17 +329,399 @@ const topSheet = (page) => page.locator('.sheet').last();
     assert.ok(Object.keys(data).some((k) => k.startsWith('wo:r:')) && 'wo:favs' in data && 'wo:exercises' in data);
   });
 
+  /* ---------------- Phase 2: live workouts ---------------- */
+  const workoutRow = (page, name, n) => page.locator('.wk-ex', { hasText: name }).locator('.wk-row:not(.wk-head)').nth(n);
+  const stats = (page) => page.textContent('#wk-stats');
+  const sessionDocs = () => [...cloud.entries()].filter(([k]) => k.startsWith('wo:s:')).map(([, r]) => r.value);
+
+  await step('workout: start from a routine, targets show as prompts, nothing pre-filled as done', async () => {
+    await a.selectOption('#pf-unit', 'lb'); // the template test above switched to kg
+    await a.click('[data-pane="workout"]');
+    await a.click('[data-start]:has-text("Push Day A")');
+    await a.waitForSelector('.wk-ex');
+    assert.equal(await a.inputValue('#wk-name'), 'Push Day A');
+    assert.match(await stats(a), /3 exercises · 0\/8 sets · 0 lb/);
+    const first = workoutRow(a, 'Barbell Bench Press', 0);
+    assert.equal(await first.locator('[data-field="w"]').getAttribute('placeholder'), '135');
+    assert.equal(await first.locator('[data-field="w"]').inputValue(), '');
+    assert.equal(await a.locator('.wk-row.done').count(), 0);
+    assert.equal(await a.locator('.wk-exname:has-text("Landmine Press")').count(), 1, 'a deleted custom exercise still works');
+  });
+
+  await step('workout: one tap records the planned numbers, and starts the rest timer', async () => {
+    const first = workoutRow(a, 'Barbell Bench Press', 0);
+    await first.locator('[data-done]').click();
+    await a.waitForSelector('.wk-row.done');
+    assert.equal(await workoutRow(a, 'Barbell Bench Press', 0).locator('[data-field="w"]').inputValue(), '135');
+    assert.match(await stats(a), /1\/8 sets · 1,350 lb/);
+    await a.waitForSelector('#wk-resttime');
+    assert.match(await a.textContent('#wk-resttime'), /^(3:00|2:5\d)$/, 'uses this exercise\'s 3 minute rest');
+    await shot(a, '08-workout');
+  });
+
+  await step('workout: typed numbers win, and stats update while typing', async () => {
+    const second = workoutRow(a, 'Barbell Bench Press', 1);
+    await second.locator('[data-field="w"]').fill('145');
+    assert.equal(await a.evaluate(() => document.activeElement.dataset.field), 'w', 'typing keeps the keyboard open');
+    await second.locator('[data-done]').click();
+    await a.waitForFunction(() => /2\/8 sets · 2,800 lb/.test(document.querySelector('#wk-stats').textContent));
+  });
+
+  await step('workout: a set needs its required value, and timed exercises record time', async () => {
+    const plank = workoutRow(a, 'Forearm Plank', 0);
+    await plank.locator('[data-done]').click();
+    await a.waitForSelector('#toast.show:has-text("Enter seconds first")');
+    assert.equal(await a.evaluate(() => document.activeElement.dataset.field), 'secs');
+    assert.equal(await plank.locator('.wk-check.on').count(), 0);
+    await plank.locator('[data-field="secs"]').fill('45');
+    await plank.locator('[data-done]').click();
+    await a.waitForFunction(() => /3\/8 sets · 2,800 lb/.test(document.querySelector('#wk-stats').textContent));
+    await workoutRow(a, 'Forearm Plank', 0).locator('[data-done]').click(); // undo
+    await a.waitForFunction(() => /2\/8 sets/.test(document.querySelector('#wk-stats').textContent));
+    assert.equal(await workoutRow(a, 'Forearm Plank', 0).locator('[data-field="secs"]').inputValue(), '45', 'undo keeps the number');
+    await workoutRow(a, 'Forearm Plank', 0).locator('[data-done]').click();
+    await a.waitForFunction(() => /3\/8 sets/.test(document.querySelector('#wk-stats').textContent));
+  });
+
+  await step('workout: a warm-up is marked and leaves volume out; sets can be added and removed', async () => {
+    await a.locator('.wk-ex', { hasText: 'Barbell Bench Press' }).locator('[data-addset]').click();
+    await a.waitForFunction(() => /3\/9 sets/.test(document.querySelector('#wk-stats').textContent));
+    const row = workoutRow(a, 'Barbell Bench Press', 2);
+    assert.equal(await row.locator('[data-field="w"]').getAttribute('placeholder'), '145', 'a new set offers the last set\'s weight');
+    await row.locator('select[data-type]').selectOption('warmup');
+    await a.waitForFunction(() => [...document.querySelectorAll('.wk-type.marked')].some((x) => x.textContent.includes('W')));
+    await workoutRow(a, 'Barbell Bench Press', 2).locator('[data-done]').click();
+    await a.waitForFunction(() => /4\/9 sets · 2,800 lb/.test(document.querySelector('#wk-stats').textContent));
+    await workoutRow(a, 'Barbell Bench Press', 2).locator('[data-rmset]').click();
+    await a.waitForFunction(() => /3\/8 sets · 2,800 lb/.test(document.querySelector('#wk-stats').textContent));
+  });
+
+  await step('workout: exercises can be added, reordered and removed mid-workout', async () => {
+    await a.click('#wk-add');
+    await topSheet(a).locator('.lift-q').fill('lateral raise');
+    await topSheet(a).locator('[data-pick="dumbbell-lateral-raise"]').click();
+    await topSheet(a).locator('#pk-done').click();
+    await a.waitForFunction(() => document.querySelectorAll('.wk-ex').length === 4);
+    await a.locator('.wk-ex', { hasText: 'Dumbbell Lateral Raise' }).locator('[data-move="-1"]').click();
+    const names = await a.locator('.wk-exname').allTextContents();
+    assert.ok(names.indexOf('Dumbbell Lateral Raise') < names.indexOf('Landmine Press'), names.join());
+    await a.locator('.wk-ex', { hasText: 'Dumbbell Lateral Raise' }).locator('[data-rmex]').click();
+    await a.waitForFunction(() => document.querySelectorAll('.wk-ex').length === 3);
+    assert.equal(a.dialogs.filter((d) => /Remove Dumbbell/.test(d)).length, 0, 'no warning when nothing was finished');
+  });
+
+  await step('rest timer: adjust, pause, skip, restart by hand, and it never blocks the screen', async () => {
+    const left = async () => a.textContent('#wk-resttime');
+    const before = await left();
+    await a.click('[data-rest-add="15"]');
+    assert.notEqual(await left(), before);
+    await a.click('[data-rest-toggle]');
+    await a.waitForSelector('[data-rest-toggle]:has-text("Resume")');
+    const held = await left();
+    await a.waitForTimeout(2100);
+    assert.equal(await left(), held, 'paused means paused');
+    await workoutRow(a, 'Barbell Bench Press', 0).locator('[data-field="reps"]').fill('10'); // still usable underneath
+    await a.click('[data-rest-toggle]');
+    await a.click('[data-rest-skip]');
+    await a.waitForSelector('[data-rest-start="60"]');
+    await a.click('[data-rest-start="30"]');
+    await a.waitForSelector('#wk-resttime');
+    await a.click('[data-rest-add="-15"]');
+    await a.click('[data-rest-add="-15"]');
+    await a.waitForSelector('#toast.show:has-text("Rest finished")', { timeout: 4000 });
+    await a.waitForSelector('[data-rest-start="60"]');
+  });
+
+  await step('recovery: a reload right after typing loses nothing, on any screen', async () => {
+    await a.click('[data-rest-start="120"]');
+    await workoutRow(a, 'Landmine Press', 0).locator('[data-field="w"]').fill('55');
+    await a.reload(); // no waiting: the auto-save delay hasn't passed
+    await a.waitForSelector('body.in-app');
+    assert.ok(await a.isVisible('.tab[data-tab="diary"].active'), 'the app opens on Diary as usual');
+    await a.waitForSelector('#lift-mini:not([hidden])');
+    assert.match(await a.textContent('#lift-mini'), /Push Day A.*Rest/s);
+    await a.click('#lift-mini');
+    await a.waitForSelector('.wk-ex');
+    assert.equal(await workoutRow(a, 'Landmine Press', 0).locator('[data-field="w"]').inputValue(), '55');
+    assert.equal(await a.locator('.wk-row.done').count(), 3);
+    assert.equal(await a.locator('#wk-resttime').count(), 1, 'the rest timer kept running');
+    await a.click('[data-rest-skip]');
+  });
+
+  await step('minimize: back button keeps it, other tabs work, and only one workout can run', async () => {
+    await a.goBack();
+    await a.waitForFunction(() => !document.querySelector('.sheet'));
+    await a.waitForSelector('#lift-mini:not([hidden])');
+    await tab(a, 'foods');
+    await tab(a, 'lift');
+    await a.click('[data-pane="workout"]');
+    await a.waitForSelector('[data-open]');
+    await a.click('[data-start]:has-text("Push Day A")');
+    await a.waitForSelector('.wk-ex');
+    assert.equal(await a.locator('.wk-row.done').count(), 3, 'reopened the same workout');
+    assert.equal(sessionDocs().length <= 1, true);
+    await a.goBack();
+    await a.waitForFunction(() => !document.querySelector('.sheet'));
+  });
+
+  await step('sync: a workout in progress reaches the other device', async () => {
+    assert.equal(await synced(a), 0);
+    assert.equal(sessionDocs().filter((s) => s.status === 'active').length, 1);
+    await b.evaluate(() => window.__plate.Sync.run());
+    await b.waitForSelector('#lift-mini:not([hidden])');
+    assert.match(await b.textContent('#lift-mini'), /Push Day A/);
+  });
+
+  await step('pause: the clock stops, the work stays editable, and it survives a reload', async () => {
+    await a.click('#lift-mini');
+    await a.waitForSelector('#wk-pause');
+    await a.click('#wk-pause');
+    await a.waitForSelector('#wk-pause:has-text("Resume")');
+    const held = await a.textContent('#wk-elapsed');
+    await a.waitForTimeout(2100);
+    assert.equal(await a.textContent('#wk-elapsed'), held);
+    await a.waitForSelector('text=Paused. The clock has stopped');
+    await a.reload();
+    await a.waitForSelector('#lift-mini:has-text("Paused")');
+    await a.click('#lift-mini');
+    await a.click('#wk-pause');
+    await a.waitForSelector('#wk-pause:has-text("Pause")');
+    const t1 = await a.textContent('#wk-elapsed');
+    await a.waitForFunction((x) => document.querySelector('#wk-elapsed').textContent !== x, t1, { timeout: 4000 });
+  });
+
+  await step('finish: warns about unfinished sets, keeps only finished ones, and double taps save once', async () => {
+    await a.fill('#wk-note', 'Felt strong');
+    await a.evaluate(() => { const f = document.querySelector('#wk-finish'); f.click(); f.click(); });
+    await a.waitForSelector('text=Workout complete');
+    assert.equal(await a.locator('.wk-sumex').count(), 2, 'Landmine had no finished sets');
+    assert.equal(await a.locator('text=Workout complete').count(), 1);
+    assert.match((await a.textContent('.wk-grid3')).replace(/\s+/g, ''), /3sets2,800lb/);
+    assert.ok(a.dialogs.some((d) => /5 unfinished sets won't be saved/.test(d)));
+    assert.equal(await a.locator('.wk-sumex li').count(), 3);
+    assert.match(await a.locator('.wk-sumex', { hasText: 'Barbell Bench Press' }).textContent(), /135 lb × 10.*145 lb × 10/s);
+    assert.match(await a.locator('.wk-sumex', { hasText: 'Forearm Plank' }).textContent(), /0:45/);
+    await shot(a, '09-summary');
+    await a.click('#sm-done');
+    await a.waitForFunction(() => !document.querySelector('.sheet'));
+    assert.equal(await a.locator('#lift-mini:not([hidden])').count(), 0);
+    assert.equal(await synced(a), 0);
+    const docs = sessionDocs();
+    assert.equal(docs.length, 1, `one record, got ${docs.length}`);
+    assert.equal(docs[0].status, 'completed');
+    assert.equal(docs[0].note, 'Felt strong');
+  });
+
+  await step('finished workouts show in this week and recent, and leave the other device\'s bar', async () => {
+    await tab(a, 'lift');
+    await a.waitForSelector('[data-summary]:has-text("Push Day A")');
+    const week = (await a.textContent('.nutgrid')).replace(/\s+/g, '');
+    assert.match(week, /^1workouts/);
+    assert.match(week, /3sets2,800lbvolume/);
+    await a.click('[data-summary]');
+    await topSheet(a).locator('text=Felt strong').waitFor();
+    await a.goBack();
+    await a.waitForFunction(() => !document.querySelector('.sheet'));
+    await b.evaluate(() => window.__plate.Sync.run());
+    await b.waitForFunction(() => { const m = document.querySelector('#lift-mini'); return !m || m.hidden; });
+  });
+
+  await step('previous: the next workout shows last time, and one tap reuses it', async () => {
+    await a.click('[data-start]:has-text("Push Day A")');
+    await a.waitForSelector('.wk-ex');
+    const one = workoutRow(a, 'Barbell Bench Press', 0), two = workoutRow(a, 'Barbell Bench Press', 1);
+    assert.equal((await one.locator('[data-use-prev]').textContent()).trim(), '135 × 10');
+    assert.equal((await two.locator('[data-use-prev]').textContent()).trim(), '145 × 10');
+    assert.equal(await two.locator('[data-field="w"]').getAttribute('placeholder'), '135', 'the plan comes first');
+    await two.locator('[data-use-prev]').click();
+    await a.waitForFunction(() => [...document.querySelectorAll('.wk-ex [data-field="w"]')].some((x) => x.value === '145'));
+    assert.equal(await workoutRow(a, 'Barbell Bench Press', 1).locator('.wk-check.on').count(), 0, 'reusing doesn\'t complete the set');
+  });
+
+  await step('discard: asks first, then it\'s gone everywhere and never counts', async () => {
+    await workoutRow(a, 'Barbell Bench Press', 1).locator('[data-done]').click();
+    await a.waitForSelector('.wk-row.done');
+    await a.click('#wk-discard');
+    await a.waitForFunction(() => !document.querySelector('.sheet'));
+    assert.ok(a.dialogs.some((d) => /Discard this workout/.test(d)));
+    assert.equal(await synced(a), 0);
+    assert.deepEqual(sessionDocs().map((s) => s.status).sort(), ['completed', 'discarded']);
+    assert.equal(Object.keys(sessionDocs().find((s) => s.status === 'discarded')).includes('exercises'), false, 'its data is really gone');
+    await a.waitForFunction(() => document.querySelectorAll('[data-summary]').length === 1);
+    assert.equal(await a.locator('#lift-mini:not([hidden])').count(), 0);
+  });
+
+  await step('empty workout: finishing with nothing done is refused; last time fills in sets', async () => {
+    await a.click('#wk-empty');
+    await a.waitForSelector('#wk-add');
+    await a.click('#wk-finish');
+    await a.waitForSelector('#toast.show:has-text("Complete at least one set")');
+    await a.click('#wk-add');
+    await topSheet(a).locator('.lift-q').fill('barbell bench');
+    await topSheet(a).locator('[data-pick="barbell-bench-press"]').click();
+    await topSheet(a).locator('#pk-done').click();
+    await a.waitForSelector('.wk-ex');
+    assert.equal(await a.locator('.wk-row:not(.wk-head)').count(), 2, 'as many sets as last time');
+    assert.equal(await workoutRow(a, 'Barbell Bench Press', 1).locator('[data-field="w"]').getAttribute('placeholder'), '145');
+    await workoutRow(a, 'Barbell Bench Press', 1).locator('[data-done]').click();
+    await a.waitForSelector('.wk-row.done');
+    assert.equal(await workoutRow(a, 'Barbell Bench Press', 1).locator('[data-field="w"]').inputValue(), '145');
+    await a.click('#wk-finish');
+    await a.waitForSelector('text=Workout complete');
+    await a.click('#sm-del');
+    await a.waitForFunction(() => !document.querySelector('.sheet'));
+    await a.waitForFunction(() => document.querySelectorAll('[data-summary]').length === 1);
+  });
+
+  await step('history stays accurate after the routine changes', async () => {
+    await a.click('[data-pane="routines"]');
+    await a.click('[data-routine]:has-text("Push Day A")');
+    await a.fill('#rt-name', 'Renamed Routine');
+    await a.locator('.lift-item', { hasText: 'Barbell Bench Press' }).locator('[data-rmitem]').click();
+    await a.click('#rt-done');
+    await a.waitForFunction(() => !document.querySelector('.sheet'));
+    await a.click('[data-pane="workout"]');
+    await a.click('[data-summary]');
+    await topSheet(a).locator('text=Barbell Bench Press').waitFor();
+    assert.match(await topSheet(a).textContent(), /Push Day A/);
+    await a.goBack();
+    await a.waitForFunction(() => !document.querySelector('.sheet'));
+  });
+
+  await step('sign-out warns about a running workout, and it comes back after signing in', async () => {
+    await a.click('#wk-empty');
+    await a.waitForSelector('#wk-add');
+    await a.goBack();
+    await a.waitForFunction(() => !document.querySelector('.sheet'));
+    await tab(a, 'settings');
+    await a.click('#a-out');
+    await a.waitForFunction(() => document.body.classList.contains('in-app') && document.querySelector('.tab[data-tab="diary"].active'));
+    assert.ok(a.dialogs.some((d) => /workout in progress/.test(d)));
+    await a.waitForSelector('#lift-mini:not([hidden])', { timeout: 5000 });
+    await a.click('#lift-mini');
+    await a.click('#wk-discard');
+    await a.waitForFunction(() => !document.querySelector('.sheet'));
+    assert.equal(await synced(a), 0);
+  });
+
+  await step('small phones: the live workout fits at 320px', async () => {
+    const small = await device(browser, base, { viewport: { width: 320, height: 568 } });
+    await tab(small, 'lift');
+    await small.click('#wk-empty');
+    await small.click('#wk-add');
+    await topSheet(small).locator('.lift-q').fill('barbell bench');
+    await topSheet(small).locator('[data-pick="barbell-bench-press"]').click();
+    await topSheet(small).locator('.lift-q').fill('plank');
+    await topSheet(small).locator('[data-pick="plank"]').click();
+    await topSheet(small).locator('#pk-done').click();
+    await small.waitForSelector('.wk-ex');
+    await workoutRow(small, 'Barbell Bench Press', 0).locator('[data-field="w"]').fill('137.5');
+    await workoutRow(small, 'Barbell Bench Press', 0).locator('[data-field="reps"]').fill('10');
+    await workoutRow(small, 'Barbell Bench Press', 0).locator('[data-done]').click();
+    await small.waitForSelector('#wk-resttime');
+    const over = await small.evaluate(() => { const s = document.querySelector('.sheet'); return s.scrollWidth - s.clientWidth; });
+    assert.ok(over <= 0, `overflows by ${over}`);
+    const size = await workoutRow(small, 'Barbell Bench Press', 0).locator('[data-done]').boundingBox();
+    assert.ok(size.width >= 38 && size.height >= 40, 'the complete button is easy to hit');
+    const clipped = await small.evaluate(() => [...document.querySelectorAll('.wk-in input')].filter((i) => i.scrollWidth > i.clientWidth).map((i) => i.value));
+    assert.deepEqual(clipped, [], 'typed numbers are fully visible');
+    const headers = await small.evaluate(() => [...document.querySelector('.wk-head').children].map((c) => c.scrollWidth <= c.clientWidth + 1));
+    assert.ok(headers.every(Boolean), `column headings fit: ${headers}`);
+    await shot(small, '10-small-workout');
+    await small.click('#wk-discard');
+    await small.waitForFunction(() => !document.querySelector('.sheet'));
+    await small.context().close();
+  });
+
+  await step('dark mode: live workout renders', async () => {
+    const dark = await device(browser, base, { colorScheme: 'dark' });
+    await tab(dark, 'lift');
+    await dark.click('#wk-empty');
+    await dark.click('#wk-add');
+    await topSheet(dark).locator('.lift-q').fill('barbell bench');
+    await topSheet(dark).locator('[data-pick="barbell-bench-press"]').click();
+    await topSheet(dark).locator('#pk-done').click();
+    await workoutRow(dark, 'Barbell Bench Press', 0).locator('[data-done]').click();
+    await shot(dark, '11-dark-workout');
+    await dark.click('#wk-discard');
+    await dark.waitForFunction(() => !document.querySelector('.sheet'));
+    assert.deepEqual(dark.errors, []);
+    await dark.context().close();
+  });
+
+  await step('offline: the installed app opens, and logs a workout that syncs later', async () => {
+    const off = await device(browser, base, { sw: true });
+    await off.evaluate(() => navigator.serviceWorker.ready);
+    await off.reload();
+    await off.waitForFunction(() => navigator.serviceWorker.controller);
+    await off.waitForSelector('body.in-app');
+    await off.waitForTimeout(500);
+    await off.context().setOffline(true);
+    await off.reload();
+    await off.waitForSelector('body.in-app');
+    await tab(off, 'lift');
+    await off.click('[data-pane="exercises"]');
+    assert.match(await off.textContent('.lift-count'), /^148 /);
+    await off.click('[data-pane="workout"]');
+    await off.click('#wk-empty');
+    await off.click('#wk-add');
+    await topSheet(off).locator('.lift-q').fill('plank');
+    await topSheet(off).locator('[data-pick="plank"]').click();
+    await topSheet(off).locator('#pk-done').click();
+    await workoutRow(off, 'Forearm Plank', 0).locator('[data-field="secs"]').fill('60');
+    await workoutRow(off, 'Forearm Plank', 0).locator('[data-done]').click();
+    await off.waitForSelector('.wk-row.done');
+    await off.reload();
+    await off.waitForSelector('#lift-mini:not([hidden])');
+    await off.context().setOffline(false);
+    await off.click('#lift-mini');
+    await off.waitForSelector('.wk-row.done');
+    await off.click('#wk-discard');
+    await off.waitForFunction(() => !document.querySelector('.sheet'));
+    await off.context().close();
+  });
+
+  await step('weak signal: the installed app still opens promptly', async () => {
+    const slow = await device(browser, base, { sw: true });
+    await slow.evaluate(() => navigator.serviceWorker.ready);
+    await slow.reload();
+    await slow.waitForFunction(() => navigator.serviceWorker.controller);
+    await slow.waitForSelector('body.in-app');
+    await slow.waitForTimeout(500);
+    serverDelayMs = 30000;
+    try {
+      const t0 = Date.now();
+      await slow.reload({ waitUntil: 'commit', timeout: 15000 });
+      await slow.waitForSelector('body.in-app', { timeout: 15000 });
+      const took = Date.now() - t0;
+      assert.ok(took < 10000, `took ${took} ms with a 30 second network`);
+    } finally { serverDelayMs = 0; }
+    await slow.context().close();
+  });
+
+  await step('weak signal: a stuck sign-in check still opens the phone\'s data', async () => {
+    const stuck = await device(browser, base);
+    await stuck.evaluate(() => localStorage.setItem('hang', '1'));
+    const t0 = Date.now();
+    await stuck.reload();
+    await stuck.waitForSelector('body.in-app', { timeout: 8000 });
+    assert.ok(Date.now() - t0 < 7000);
+    await stuck.evaluate(() => localStorage.removeItem('hang'));
+    await stuck.context().close();
+  });
+
   await step('small phones: no sideways scrolling, and all 7 tabs fit', async () => {
     const small = await device(browser, base, { viewport: { width: 320, height: 568 } });
     for (const t of ['diary', 'foods', 'lift', 'friends', 'report', 'settings']) { await tab(small, t); assert.ok((await overflow(small)) <= 0, t); }
     await tab(small, 'lift');
+    await small.click('[data-pane="routines"]');
     const box = await small.evaluate(() => [...document.querySelectorAll('.tab')].map((t) => { const r = t.getBoundingClientRect(); return [r.left, r.right]; }));
     assert.equal(box.length, 7);
     box.forEach(([l, r]) => assert.ok(l >= 0 && r <= 320));
     const labels = await small.evaluate(() => [...document.querySelectorAll('.tab span')].map((s) => s.scrollWidth <= s.parentElement.clientWidth));
     assert.ok(labels.every(Boolean), 'tab labels fit');
     await shot(small, '05-small');
-    await small.click('[data-routine]:has-text("Push Day A")');
+    await small.click('[data-routine]:has-text("Renamed Routine")');
     await small.waitForSelector('.lift-item');
     const sheetOverflow = await small.evaluate(() => { const s = document.querySelector('.sheet'); return s.scrollWidth - s.clientWidth; });
     assert.ok(sheetOverflow <= 0, `editor overflows by ${sheetOverflow}`);
@@ -349,6 +746,10 @@ const topSheet = (page) => page.locator('.sheet').last();
     await a.click('#wipe');
     await a.waitForSelector('#toast.show:has-text("Erased")');
     await tab(a, 'lift');
+    await a.click('[data-pane="workout"]');
+    await a.waitForSelector('#wk-empty');
+    assert.equal(await a.locator('[data-summary]').count(), 0, 'workouts are gone');
+    await a.click('[data-pane="routines"]');
     await a.waitForSelector('text=+ New routine');
     assert.equal(await a.locator('[data-routine]').count(), 0);
     assert.equal(cloud.size, 0);

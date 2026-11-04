@@ -5,7 +5,7 @@
   'use strict';
   const C = window.Core;
   const { r1, num, MEALS } = C;
-  const VERSION = '1.4.0';
+  const VERSION = '1.5.0';
   const $ = (s, el = document) => el.querySelector(s);
   const $$ = (s, el = document) => [...el.querySelectorAll(s)];
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -245,6 +245,7 @@
     search: '<svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5"/></svg>',
     star: '<svg viewBox="0 0 24 24"><path d="M12 3l2.6 5.6 6 .7-4.5 4.1 1.2 6L12 16.4 6.7 19.4l1.2-6L3.4 9.3l6-.7z"/></svg>',
     plus: '<svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>',
+    down: '<svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>',
   };
   const MEAL_ICON = {
     Breakfast: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M5.6 18.4L7 17M17 7l1.4-1.4"/></svg>',
@@ -1200,7 +1201,7 @@
       e.target.value = '';
     };
     $('#wipe').onclick = async () => {
-      if (!confirm(cloud ? 'Erase your entire log, foods, meals, workout routines, settings, username and friends — on every device and in your account? This cannot be undone.' : 'Erase your entire log, foods, meals, workout routines and settings on this phone? This cannot be undone.')) return;
+      if (!confirm(cloud ? 'Erase your entire log, foods, meals, workouts, routines, settings, username and friends — on every device and in your account? This cannot be undone.' : 'Erase your entire log, foods, meals, workouts, routines and settings on this phone? This cannot be undone.')) return;
       if (!confirm('Really erase everything? Consider downloading a backup first.')) return;
       try { if (cloud) await remote.wipe(); }
       catch (err) { return toast("Couldn't reach your account — nothing was erased. Try again online."); }
@@ -1305,7 +1306,9 @@
   }
 
   async function signOut() {
+    await window.PlateLift.flush();
     if (meta.dirty.length) await Sync.run();
+    if (window.PlateLift.hasOpenWorkout() && !confirm('You have a workout in progress. Sign out anyway? Once it has synced, you can pick it back up after signing in.')) return;
     if (meta.dirty.length && !confirm(`${meta.dirty.length} change(s) haven't reached your account yet (you may be offline). Sign out anyway and lose them?`)) return;
     if (!confirm('Sign out? Your log stays safe in your account; it is removed from this phone until you sign in again.')) return;
     try { await remote.signOut(); } catch (e) { /* signing out locally is enough */ }
@@ -1370,7 +1373,10 @@
       if (ev === 'SIGNED_OUT' && user) location.replace(appUrl());
     });
     let u = null;
-    try { u = await remote.getUser(); }
+    try {
+      // A weak signal can leave this waiting forever, so give up after a few seconds and open from this phone.
+      u = await Promise.race([remote.getUser(), new Promise((_, rej) => setTimeout(() => rej(new Error('sign-in check timed out')), 4000))]);
+    }
     catch (e) {
       // Can't reach the server (e.g. no signal): open the signed-in person's log from this phone anyway.
       console.warn(e);
@@ -1386,6 +1392,6 @@
   }
   window.__plate = { S, C, DB, makePDF, buildReport, Sync, get meta() { return meta; } }; // for debugging
   /* What lift.js needs from here. Everything else in this file stays private. */
-  window.PlateApp = { DB, put, S, $, $$, esc, ICON, toast, openSheet, closeSheets, sheetHead, wireClose, sheetsOpen: () => sheets.length > 0 };
+  window.PlateApp = { DB, put, S, C, $, $$, esc, ICON, toast, owner: () => meta.owner, openSheet, closeSheets, sheetHead, wireClose, sheetsOpen: () => sheets.length > 0 };
   boot();
 })();

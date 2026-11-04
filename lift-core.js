@@ -176,8 +176,161 @@
     return r;
   }
 
-  const api = { MUSCLES, EQUIPMENT, LEVELS, MEASURES, REST_CHOICES, TEMPLATES, muscleLabel, equipmentLabel, levelLabel, measureFields,
+  /* ---------- Workout sessions ----------
+     A session is what you actually did. It copies everything it needs when it starts, so later changes
+     to a routine or exercise can't alter it, and its id never changes, so saving it again (or an upload
+     retrying) overwrites the same record instead of creating a duplicate.
+     session = { id, status: 'active'|'paused'|'completed'|'discarded', name, routineId, startedAt, endedAt,
+       pausedAt, pausedMs, note, updatedAt, exercises: [exercise] }
+     exercise = { uid, exId, name, primary, secondary, equipment, measure, unilateral, rest, note, sets: [set] }
+     set = { id, type, w, u, reps, secs, dist, done, doneAt, target } where target holds the planned values. */
+  const SET_TYPES = [
+    { id: 'warmup', label: 'Warm-up', mark: 'W' }, { id: 'normal', label: 'Working set', mark: '' }, { id: 'drop', label: 'Drop set', mark: 'D' },
+    { id: 'failure', label: 'To failure', mark: 'F' }, { id: 'amrap', label: 'AMRAP', mark: 'A' },
+  ];
+  const VALUE_FIELDS = ['w', 'reps', 'secs', 'dist'];
+  function newSessionSet(unit, target) {
+    return { id: newId(), type: 'normal', w: null, u: unit === 'kg' ? 'kg' : 'lb', reps: null, secs: null, dist: null, done: false, doneAt: null, target: target || null };
+  }
+  function sessionExercise(ex, prefs, setCount) {
+    const p = prefs || {};
+    const sets = [];
+    for (let i = 0; i < Math.max(1, setCount || 3); i++) sets.push(newSessionSet(p.unit));
+    return { uid: newId(), exId: ex.id, name: ex.name, primary: ex.primary, secondary: ex.secondary || [], equipment: ex.equipment || '',
+      measure: ex.measure, unilateral: !!ex.unilateral, rest: p.rest != null ? p.rest : 90, note: '', sets };
+  }
+  function newSession(routine, findExercise, prefs, now) {
+    const t = now || Date.now();
+    const s = { id: newId(), status: 'active', name: (routine && routine.name) || 'Workout', routineId: routine ? routine.id : null,
+      startedAt: t, endedAt: null, pausedAt: null, pausedMs: 0, note: '', updatedAt: t, exercises: [] };
+    ((routine && routine.items) || []).forEach((item) => {
+      const found = (findExercise && findExercise(item.exId)) || {};
+      s.exercises.push({ uid: newId(), exId: item.exId, name: item.name, primary: item.primary, secondary: found.secondary || [], equipment: found.equipment || '',
+        measure: item.measure, unilateral: !!found.unilateral, rest: item.rest, note: item.note || '',
+        sets: item.sets.map((t2) => newSessionSet(t2.u, { w: t2.w, u: t2.u, reps: t2.reps, secs: t2.secs, dist: t2.dist })) });
+    });
+    return s;
+  }
+  /* A new set starts from what the last set did, or planned to do. */
+  function addSessionSet(exercise, unit) {
+    const last = exercise.sets[exercise.sets.length - 1];
+    if (!last) { exercise.sets.push(newSessionSet(unit)); return exercise; }
+    const value = (f) => (last[f] != null ? last[f] : last.target ? last.target[f] : null);
+    exercise.sets.push(newSessionSet(last.u, { w: value('w'), u: last.u, reps: value('reps'), secs: value('secs'), dist: value('dist') }));
+    return exercise;
+  }
+  function removeSessionSet(exercise, setId) { exercise.sets = exercise.sets.filter((s) => s.id !== setId); return exercise; }
+  /* The most recent finished performance of an exercise: { at, sets } with done sets only, or null. */
+  function lastPerformance(sessions, exId, excludeSessionId) {
+    let best = null;
+    (sessions || []).forEach((s) => {
+      if (s.status !== 'completed' || s.id === excludeSessionId || (best && s.startedAt <= best.at)) return;
+      const ex = s.exercises.find((e) => e.exId === exId && e.sets.some((x) => x.done));
+      if (ex) best = { at: s.startedAt, sets: ex.sets.filter((x) => x.done) };
+    });
+    return best;
+  }
+  /* What a blank set would be recorded as: the plan if there is one, otherwise last time's numbers. */
+  function setHint(set, previous) {
+    const t = set.target || {}, p = previous || {};
+    const hint = { w: null, reps: null, secs: null, dist: null };
+    if (t.w != null) hint.w = t.u === set.u ? t.w : Math.round(convertWeight(t.w, t.u, set.u) * 10) / 10;
+    else if (p.w != null) hint.w = p.u === set.u ? p.w : Math.round(convertWeight(p.w, p.u, set.u) * 10) / 10;
+    ['reps', 'secs', 'dist'].forEach((f) => { hint[f] = t[f] != null ? t[f] : p[f] != null ? p[f] : null; });
+    return hint;
+  }
+  /* The one value a set can't be recorded without. Weight is optional because bands and bodyweight have none. */
+  const requiredField = (measure) => { const f = measureFields(measure); return f.includes('reps') ? 'reps' : f[f.length - 1]; };
+  /* Fills blanks from the hint and marks the set done. Returns false if the required value is still missing. */
+  function completeSet(set, hint, measure, now) {
+    const fields = measureFields(measure);
+    const need = requiredField(measure);
+    if ((set[need] != null ? set[need] : (hint || {})[need]) == null) return false;
+    fields.forEach((f) => { if (set[f] == null && hint && hint[f] != null) set[f] = hint[f]; });
+    set.done = true; set.doneAt = now || Date.now();
+    return true;
+  }
+  /* Volume = weight x reps on finished sets. Warm-ups don't count, and neither does assistance, because
+     more assistance means less work. Timed and distance sets have no weight x reps to compare. */
+  function setVolumeKg(set, measure) {
+    if (!set.done || set.type === 'warmup' || !(measure === 'weight_reps' || measure === 'reps')) return 0;
+    if (!(set.w > 0) || !(set.reps > 0)) return 0;
+    return toKg(set.w, set.u) * set.reps;
+  }
+  function sessionStats(session) {
+    let sets = 0, done = 0, volumeKg = 0;
+    session.exercises.forEach((e) => e.sets.forEach((x) => {
+      sets += 1;
+      if (x.done) done += 1;
+      volumeKg += setVolumeKg(x, e.measure);
+    }));
+    return { exercises: session.exercises.length, sets, done, volumeKg };
+  }
+  /* Training time, leaving out time spent paused. */
+  function sessionDuration(s, now) {
+    const end = s.endedAt || (s.status === 'paused' && s.pausedAt) || now || Date.now();
+    return Math.max(0, end - s.startedAt - (s.pausedMs || 0));
+  }
+  function pauseSession(s, now) { if (s.status === 'active') { s.status = 'paused'; s.pausedAt = now || Date.now(); } return s; }
+  function resumeSession(s, now) {
+    if (s.status === 'paused') { s.pausedMs = (s.pausedMs || 0) + Math.max(0, (now || Date.now()) - s.pausedAt); s.pausedAt = null; s.status = 'active'; }
+    return s;
+  }
+  /* Only finished sets are kept, and exercises with none are dropped. Finishing twice changes nothing. */
+  function finishSession(s, now) {
+    if (s.status === 'completed') return s;
+    const t = now || Date.now();
+    if (s.status === 'paused') resumeSession(s, t);
+    s.exercises = s.exercises.map((e) => Object.assign({}, e, { sets: e.sets.filter((x) => x.done) })).filter((e) => e.sets.length);
+    s.status = 'completed'; s.endedAt = t; s.updatedAt = t;
+    return s;
+  }
+  const discardedSession = (s, now) => { const t = now || Date.now(); return { id: s.id, status: 'discarded', startedAt: s.startedAt, discardedAt: t, updatedAt: t }; };
+  /* Totals for sessions that started in [fromMs, toMs). */
+  function periodSummary(sessions, fromMs, toMs) {
+    const out = { workouts: 0, durationMs: 0, sets: 0, volumeKg: 0 };
+    (sessions || []).forEach((s) => {
+      if (s.status !== 'completed' || s.startedAt < fromMs || s.startedAt >= toMs) return;
+      const st = sessionStats(s);
+      out.workouts += 1; out.durationMs += sessionDuration(s); out.sets += st.done; out.volumeKg += st.volumeKg;
+    });
+    return out;
+  }
+  function formatClock(ms) {
+    const total = Math.max(0, Math.ceil(ms / 1000));
+    const h = Math.floor(total / 3600), m = Math.floor((total % 3600) / 60), sec = total % 60;
+    const two = (n) => String(n).padStart(2, '0');
+    return h ? `${h}:${two(m)}:${two(sec)}` : `${m}:${two(sec)}`;
+  }
+  /* "135 lb × 10". plain drops the unit, for the narrow Previous column. */
+  function formatSet(set, measure, plain) {
+    const weight = set.w != null ? (plain ? `${set.w}` : `${set.w} ${set.u}`) : '';
+    if (measure === 'time') return set.secs != null ? formatClock(set.secs * 1000) : '';
+    if (measure === 'distance') return set.dist != null ? `${set.dist} m` : '';
+    if (measure === 'weight_distance') return [weight, set.dist != null ? `${set.dist} m` : ''].filter(Boolean).join(' × ');
+    if (set.reps == null) return weight;
+    if (measure === 'assisted' && weight && !plain) return `${weight} assist × ${set.reps}`;
+    return weight ? `${weight} × ${set.reps}` : plain ? `${set.reps}` : `${set.reps} reps`;
+  }
+
+  /* ---------- Rest timer ----------
+     Stores when the rest ends rather than counting down, so it's right even if the phone was asleep.
+     rest = { endsAt, duration, pausedLeft } where pausedLeft is set only while paused. */
+  const startRest = (seconds, now) => ({ endsAt: (now || Date.now()) + seconds * 1000, duration: seconds, pausedLeft: null });
+  const restLeft = (r, now) => (r.pausedLeft != null ? r.pausedLeft : Math.max(0, r.endsAt - (now || Date.now())));
+  function pauseRest(r, now) { if (r.pausedLeft == null) r.pausedLeft = restLeft(r, now); return r; }
+  function resumeRest(r, now) { if (r.pausedLeft != null) { r.endsAt = (now || Date.now()) + r.pausedLeft; r.pausedLeft = null; } return r; }
+  function adjustRest(r, seconds, now) {
+    const left = Math.max(0, restLeft(r, now) + seconds * 1000);
+    if (r.pausedLeft != null) r.pausedLeft = left; else r.endsAt = (now || Date.now()) + left;
+    return r;
+  }
+
+  const api = { MUSCLES, EQUIPMENT, LEVELS, MEASURES, REST_CHOICES, TEMPLATES, SET_TYPES, VALUE_FIELDS, muscleLabel, equipmentLabel, levelLabel, measureFields,
     cleanNumber, toKg, fromKg, convertWeight, searchExercises, validateCustom, customFromForm,
-    newRoutine, newSet, newItem, addSet, removeSet, moveItem, duplicateRoutine, routineStats, routineHasContent, routineFromTemplate };
+    newRoutine, newSet, newItem, addSet, removeSet, moveItem, duplicateRoutine, routineStats, routineHasContent, routineFromTemplate,
+    newSessionSet, sessionExercise, newSession, addSessionSet, removeSessionSet, lastPerformance, setHint, requiredField, completeSet, setVolumeKg,
+    sessionStats, sessionDuration, pauseSession, resumeSession, finishSession, discardedSession, periodSummary, formatClock, formatSet,
+    startRest, restLeft, pauseRest, resumeRest, adjustRest };
   if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.LiftCore = api;
 })(typeof self !== 'undefined' ? self : this);

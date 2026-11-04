@@ -1,10 +1,17 @@
 PLATE — food & macro log (v1.3, with friends)
 ================================================
 
+WHAT'S NEW IN 1.5
+- Record workouts in the Lift tab: weights, reps and sets as you go, with last time's numbers beside you
+  and a rest timer. A workout saves itself as you go and can be picked back up after a reload or lost signal.
+- The app opens faster on a weak signal. If the network hasn't answered in 3 seconds it uses the saved copy.
+- The rest alert only plays while the app is open. If the phone is locked, the timer will be right when
+  you come back, but it can't alert you.
+
 WHAT'S NEW IN 1.4
 - Lift tab: an exercise library you can search and filter, your own custom exercises, and a routine
   builder with templates to copy. No database setup needed: it saves to your account like your food log.
-  Recording workouts comes next. Exercise instructions are general guidance, not medical advice.
+  Exercise instructions are general guidance, not medical advice.
 
 WHAT'S NEW IN 1.3
 - A brighter, more modern look, in both light and dark mode. Nothing about your data changes.
