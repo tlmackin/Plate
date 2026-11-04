@@ -426,6 +426,35 @@ body.has-mini .toast { bottom: calc(var(--tabbar) + env(safe-area-inset-bottom) 
 .wk-sumex ol { margin: 8px 0 0; padding-left: 22px; }
 .wk-sumex p { margin: 8px 0 0; }
 
+/* ---- Lift: workout of the day ---- */
+.wod-name { font-size: 22px !important; font-weight: 800 !important; letter-spacing: -.015em; margin-bottom: 4px !important; }
+.wod-about { margin: 0 0 10px; }
+.wod-gear { display: block; margin-top: 3px; font-weight: 700; color: var(--ink-2); }
+.wod-levels { padding-bottom: 10px; }
+.wod-levels button { flex: 1 1 auto; padding: 8px 8px; font-size: 13.5px; }
+.wod-format { margin: 2px 0 10px; }
+.wod-scheme { margin: 0 0 6px; font-size: 16px; font-weight: 800; }
+.wod-moves { list-style: none; margin: 0; padding: 0; }
+.wod-moves li { padding: 8px 0; border-top: 1px solid var(--line); font-size: 15px; }
+.wod-moves li:first-child { border-top: 0; }
+.wod-move { border: 0; background: none; padding: 0; min-height: 24px; text-align: left; font-weight: 600; color: var(--accent); text-decoration: underline; text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent); text-underline-offset: 3px; }
+.wod-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.lift-panes button { flex: 1 1 auto; padding: 8px 6px; font-size: 13.5px; }
+@media (max-width: 359px) { /* every level and tab stays visible on the smallest phones */
+  .lift-panes { gap: 4px; }
+  .lift-panes button { font-size: 12.5px; padding: 8px 4px; }
+  .wod-levels { gap: 4px; }
+  .wod-levels button { font-size: 12px; padding: 8px 2px; word-spacing: 0; }
+}
+.wod-best { color: var(--ink); text-align: center; }
+.wod-clock { text-align: center; padding: 18px 12px; }
+.wod-clock b { display: block; font-size: 60px; font-weight: 800; letter-spacing: -.03em; line-height: 1.1; color: var(--accent); }
+.wod-ready .wod-clock b { color: var(--amber); }
+.wod-rounds { display: flex; align-items: center; gap: 8px; }
+.wod-rounds span { flex: 1; font-size: 14px; font-weight: 600; color: var(--ink-2); min-width: 0; }
+.wod-rounds b { font-size: 26px; font-weight: 800; min-width: 34px; text-align: center; }
+.wod-plus { width: auto; flex: none; padding: 11px 14px; font-size: 15px; }
+
 /* ---- Sign-in screens ---- */
 body:not(.in-app) .tabs { display: none; }
 body.auth-mode { padding-bottom: env(safe-area-inset-bottom); }

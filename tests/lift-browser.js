@@ -96,6 +96,31 @@ const topSheet = (page) => page.locator('.sheet').last();
     assert.ok(cloud.has('myFoods'));
   });
 
+  await step('a save and its upload flag land together, even if the page closes straight after', async () => {
+    const check = await a.evaluate(async () => {
+      const { DB } = window.__plate;
+      await DB.setBoth('zz:a', 1, 'zz:b', 2);
+      const both = [await DB.get('zz:a'), await DB.get('zz:b')];
+      await DB.del('zz:a'); await DB.del('zz:b');
+      return both;
+    });
+    assert.deepEqual(check, [1, 2]);
+    await a.reload();
+    await a.waitForSelector('body.in-app');
+    await tab(a, 'foods');
+    await a.click('button[data-p="mine"]');
+    await a.click('#newfood');
+    await a.fill('#ff-name', 'Flag check');
+    await a.fill('#ff-k', '10');
+    await a.evaluate(() => document.querySelector('#ff-save').click());
+    await a.waitForFunction(async () => (await window.__plate.DB.get('_meta')).dirty.includes('myFoods'));
+    await a.reload();
+    await a.waitForSelector('body.in-app');
+    await a.waitForFunction(() => window.__plate.Sync.state === 'ok');
+    assert.equal(await synced(a), 0);
+    assert.ok(cloud.get('myFoods').value.some((f) => f.name === 'Flag check'), 'it still reaches the account after a reload');
+  });
+
   await step('Lift tab opens on Workout, with an empty week and no pretend history', async () => {
     await tab(a, 'lift');
     await a.waitForSelector('#wk-empty');
@@ -645,6 +670,240 @@ const topSheet = (page) => page.locator('.sheet').last();
     await shot(dark, '11-dark-workout');
     await dark.click('#wk-discard');
     await dark.waitForFunction(() => !document.querySelector('.sheet'));
+    assert.deepEqual(dark.errors, []);
+    await dark.context().close();
+  });
+
+  /* ---------------- Workout of the day ---------------- */
+  const wodBox = { self: {} };
+  require('node:vm').runInNewContext(fs.readFileSync(path.join(ROOT, 'wods.js'), 'utf8'), wodBox);
+  const WODS = wodBox.self.PLATE_WODS;
+  const dayNow = await a.evaluate(() => window.__plate.C.ymd(new Date()));
+  const [yy, mm, dd] = dayNow.split('-').map(Number);
+  const todayWod = WODS[Math.floor(Date.UTC(yy, mm - 1, dd) / 86400000) % WODS.length];
+  const wodResultDocs = () => sessionDocs().filter((s) => s.status === 'completed' && s.wod);
+  /* Skips the 10 second "get ready" and any part of the clock, without waiting for real minutes. */
+  const shiftClock = (page, ms) => page.evaluate(async (delta) => {
+    const { DB } = window.__plate;
+    for (const k of await DB.keys()) {
+      if (typeof k !== 'string' || !k.startsWith('wo:s:')) continue;
+      const s = await DB.get(k);
+      if (s && (s.status === 'active' || s.status === 'paused')) { s.startedAt -= delta; s.updatedAt = Date.now(); await DB.set(k, s); }
+    }
+  }, ms);
+  const openWodPane = async (page) => { await tab(page, 'lift'); await page.click('[data-pane="wod"]'); await page.waitForSelector('#wod-card'); };
+
+  await step('WOD: today\'s workout shows, starting at Beginner', async () => {
+    await openWodPane(a);
+    assert.equal((await a.textContent('.wod-name')).trim(), todayWod.name);
+    assert.equal(await a.getAttribute('[data-level="beginner"]', 'aria-pressed'), 'true');
+    assert.equal((await a.textContent('.wod-scheme')).trim(), todayWod.levels.beginner[1]);
+    await shot(a, '12-wod');
+  });
+
+  await step('WOD: each level changes the workout, and the choice is saved and synced', async () => {
+    await a.click('[data-level="advanced"]');
+    await a.waitForFunction((x) => document.querySelector('.wod-scheme').textContent.trim() === x, todayWod.levels.advanced[1]);
+    assert.equal(await a.locator('.wod-moves li').count(), todayWod.levels.advanced[2].length);
+    await a.waitForTimeout(300); // let the save land, as any real tap would
+    await a.reload();
+    await a.waitForSelector('body.in-app');
+    await openWodPane(a);
+    assert.equal(await a.getAttribute('[data-level="advanced"]', 'aria-pressed'), 'true');
+    assert.equal(await synced(a), 0);
+    await b.evaluate(() => window.__plate.Sync.run());
+    await openWodPane(b);
+    await b.waitForFunction(() => document.querySelector('[data-level="advanced"]').getAttribute('aria-pressed') === 'true');
+    await a.click('[data-level="beginner"]');
+    await a.waitForFunction(() => document.querySelector('[data-level="beginner"]').getAttribute('aria-pressed') === 'true');
+  });
+
+  await step('WOD: a movement opens its how-to, and every WOD can be browsed and filtered', async () => {
+    const link = a.locator('#wod-card .wod-move').first();
+    await link.click();
+    await topSheet(a).locator('text=How to do it').waitFor();
+    await a.goBack();
+    await a.waitForFunction(() => !document.querySelector('.sheet'));
+    assert.equal(await a.locator('[data-wod]').count(), WODS.length);
+    await a.selectOption('#wf-format', 'emom');
+    assert.equal(await a.locator('[data-wod]').count(), WODS.filter((w) => w.format === 'emom').length);
+    await a.selectOption('#wf-gear', 'none');
+    assert.equal(await a.locator('[data-wod]').count(), WODS.filter((w) => w.format === 'emom' && w.equipment.includes('none')).length);
+    await a.selectOption('#wf-format', '');
+    await a.selectOption('#wf-gear', '');
+  });
+
+  const amrap = WODS.find((w) => w.format === 'amrap');
+  await step('WOD timer: gets ready, counts rounds, survives a reload, and only one can run', async () => {
+    await a.click(`[data-wod="${amrap.id}"]`);
+    await topSheet(a).locator('[data-wod-start]').click();
+    await a.waitForSelector('#wod-time');
+    assert.match(await a.textContent('#wod-label'), /Get ready/);
+    assert.equal(await a.isDisabled('#wod-pause'), true, 'no pausing before it starts');
+    await a.click('#wod-more');
+    await a.click('#wod-more');
+    await a.click('#wod-more');
+    await a.click('#wod-less');
+    assert.equal((await a.textContent('#wod-rounds')).trim(), '2');
+    await shiftClock(a, 11000);
+    await a.reload();
+    await a.waitForSelector('#lift-mini:not([hidden])');
+    assert.match(await a.textContent('#lift-mini'), new RegExp(amrap.name));
+    await a.click('#lift-mini');
+    await a.waitForSelector('#wod-time');
+    assert.match(await a.textContent('#wod-label'), /Time left/);
+    assert.equal((await a.textContent('#wod-rounds')).trim(), '2');
+    await shot(a, '13-wod-timer');
+    await a.click('#wod-pause');
+    await a.waitForSelector('#wod-label:has-text("Paused")');
+    const held = await a.textContent('#wod-time');
+    await a.waitForTimeout(2100);
+    assert.equal(await a.textContent('#wod-time'), held);
+    await a.click('#wod-pause');
+    await a.goBack();
+    await a.waitForFunction(() => !document.querySelector('.sheet'));
+    await openWodPane(a);
+    await a.locator('#wod-card [data-wod-start]').click();
+    await a.waitForSelector('#toast.show:has-text("Finish or discard")');
+    await a.waitForSelector('#wod-rounds');
+    assert.equal((await a.textContent('#wod-rounds')).trim(), '2', 'reopened the running WOD');
+  });
+
+  await step('WOD result: rounds carry over, double taps save once, and it lands in history', async () => {
+    await a.click('#wod-finish');
+    assert.equal(await topSheet(a).locator('#wr-rounds').inputValue(), '2');
+    await topSheet(a).locator('#wr-reps').fill('7');
+    await topSheet(a).locator('#wr-note').fill('Scaled the swings');
+    await a.evaluate(() => { const b = document.querySelector('#wr-save'); b.click(); b.click(); });
+    await a.waitForSelector('text=WOD complete');
+    assert.match((await a.textContent('.wk-grid3')).replace(/\s+/g, ' '), /2 rounds \+ 7 reps/);
+    assert.equal(await a.locator('.wod-best').count(), 0, 'a first result is not called a new best');
+    await shot(a, '14-wod-summary');
+    await a.click('#sm-done');
+    await a.waitForFunction(() => !document.querySelector('.sheet'));
+    assert.equal(await synced(a), 0);
+    assert.equal(wodResultDocs().length, 1);
+    assert.deepEqual(wodResultDocs()[0].wod.score, { rounds: 2, reps: 7 });
+    assert.equal(wodResultDocs()[0].note, 'Scaled the swings');
+    await a.click('[data-pane="workout"]');
+    await a.waitForSelector(`[data-summary]:has-text("${amrap.name}")`);
+    assert.match(await a.locator(`[data-summary]:has-text("${amrap.name}")`).textContent(), /WOD · Beginner · 2 rounds \+ 7 reps/);
+    await a.locator(`[data-summary]:has-text("${amrap.name}")`).click();
+    await topSheet(a).locator('text=Scaled the swings').waitFor();
+    await a.goBack();
+    await a.waitForFunction(() => !document.querySelector('.sheet'));
+  });
+
+  await step('WOD result: a better score is called out, but only against the same level', async () => {
+    const logIt = async (rounds) => {
+      await openWodPane(a);
+      await a.click(`[data-wod="${amrap.id}"]`);
+      await topSheet(a).locator('[data-wod-log]').click();
+      await topSheet(a).locator('#wr-rounds').fill(String(rounds));
+      await topSheet(a).locator('#wr-save').click();
+      await a.waitForSelector('text=WOD complete');
+    };
+    await logIt(5);
+    assert.equal(await a.locator('.wod-best').count(), 1);
+    await a.click('#sm-done');
+    await a.waitForFunction(() => !document.querySelector('.sheet'));
+    await logIt(1);
+    assert.equal(await a.locator('.wod-best').count(), 0, 'a lower score is not a best');
+    await a.click('#sm-done');
+    await a.waitForFunction(() => !document.querySelector('.sheet'));
+    await a.click('[data-level="advanced"]');
+    await a.waitForFunction(() => document.querySelector('[data-level="advanced"]').getAttribute('aria-pressed') === 'true');
+    await logIt(1);
+    assert.equal(await a.locator('.wod-best').count(), 0, 'no best on a level\'s first result, whatever the other levels scored');
+    await a.click('#sm-done');
+    await a.waitForFunction(() => !document.querySelector('.sheet'));
+    await openWodPane(a);
+    await a.click('[data-level="beginner"]');
+    await a.locator(`[data-wod="${amrap.id}"]`).click();
+    await topSheet(a).locator('text=Best:').waitFor();
+    assert.match(await topSheet(a).locator('.wod-results').textContent(), /Best: 5 rounds/);
+    await a.goBack();
+    await a.waitForFunction(() => !document.querySelector('.sheet'));
+  });
+
+  await step('WOD timer: time running out sounds once and asks for a result', async () => {
+    const emom = WODS.find((w) => w.format === 'emom');
+    await a.click(`[data-wod="${emom.id}"]`);
+    await topSheet(a).locator('[data-wod-start]').click();
+    await a.waitForSelector('#wod-time');
+    await a.goBack();
+    await a.waitForFunction(() => !document.querySelector('.sheet'));
+    await shiftClock(a, 10000 + emom.levels.beginner[0] * 60000 - 1500);
+    await a.reload();
+    await a.waitForSelector('#lift-mini:not([hidden])');
+    await a.click('#lift-mini');
+    await a.waitForSelector('#wr-done', { timeout: 6000 });
+    assert.equal(await a.inputValue('#wr-done'), String(emom.levels.beginner[0]));
+    await a.fill('#wr-done', '99');
+    await a.click('#wr-save');
+    await a.waitForSelector('#toast.show:has-text("Enter a number of minutes")');
+    await a.fill('#wr-done', '3');
+    await a.click('#wr-save');
+    await a.waitForSelector('text=WOD complete');
+    assert.equal(await a.locator('.sheet').count(), 1, 'timer and form both closed');
+    await a.click('#sm-done');
+    await a.waitForFunction(() => !document.querySelector('.sheet'));
+    assert.equal(await a.locator('#lift-mini:not([hidden])').count(), 0);
+  });
+
+  await step('WOD timer: a for-time workout stops when you say, and discard leaves no result', async () => {
+    const ft = WODS.find((w) => w.format === 'for_time');
+    assert.equal(await synced(a), 0);
+    const before = wodResultDocs().length;
+    await openWodPane(a);
+    await a.click(`[data-wod="${ft.id}"]`);
+    await topSheet(a).locator('[data-wod-start]').click();
+    await a.waitForSelector('#wod-time');
+    await a.click('#wod-discard');
+    await a.waitForFunction(() => !document.querySelector('.sheet'));
+    assert.equal(await a.locator('#lift-mini:not([hidden])').count(), 0);
+    await a.click(`[data-wod="${ft.id}"]`);
+    await topSheet(a).locator('[data-wod-start]').click();
+    await a.waitForSelector('#wod-time');
+    await a.goBack();
+    await a.waitForFunction(() => !document.querySelector('.sheet'));
+    await shiftClock(a, 10000 + 125000);
+    await a.reload();
+    await a.waitForSelector('#lift-mini:not([hidden])');
+    await a.click('#lift-mini');
+    await a.waitForSelector('#wod-finish:has-text("Done")');
+    await a.click('#wod-finish');
+    assert.equal(await a.inputValue('#wr-mins'), '2');
+    await a.fill('#wr-mins', '4');
+    await a.fill('#wr-secs', '30');
+    await a.click('#wr-save');
+    await a.waitForSelector('text=WOD complete');
+    assert.match((await a.textContent('.wk-grid3')).replace(/\s+/g, ' '), /4:30.*4:30/, 'score and time agree');
+    await a.click('#sm-done');
+    await a.waitForFunction(() => !document.querySelector('.sheet'));
+    assert.equal(await synced(a), 0);
+    assert.equal(wodResultDocs().length, before + 1);
+    assert.deepEqual(a.errors, []);
+  });
+
+  await step('WOD: fits at 320px and works in dark mode', async () => {
+    const small = await device(browser, base, { viewport: { width: 320, height: 568 } });
+    await openWodPane(small);
+    assert.ok((await overflow(small)) <= 0);
+    const cut = await small.evaluate(() => [...document.querySelectorAll('.wod-levels, .lift-panes')].map((s) => s.scrollWidth - s.clientWidth));
+    assert.ok(cut.every((n) => n <= 0), `levels and tabs all visible without scrolling: ${cut}`);
+    await shot(small, '15-wod-small');
+    await small.locator('#wod-card [data-wod-start]').click();
+    await small.waitForSelector('#wod-time');
+    const over = await small.evaluate(() => { const s = document.querySelector('.sheet'); return s.scrollWidth - s.clientWidth; });
+    assert.ok(over <= 0, `overflows by ${over}`);
+    await small.click('#wod-discard');
+    await small.waitForFunction(() => !document.querySelector('.sheet'));
+    assert.equal(await synced(small), 0);
+    await small.context().close();
+    const dark = await device(browser, base, { colorScheme: 'dark' });
+    await openWodPane(dark);
+    await shot(dark, '16-wod-dark');
     assert.deepEqual(dark.errors, []);
     await dark.context().close();
   });

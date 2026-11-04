@@ -14,7 +14,7 @@ const byId = (id) => LIB.find((e) => e.id === id);
 test('service worker: its file list is real and includes the lift files', () => {
   const sw = fs.readFileSync(path.join(__dirname, '..', 'sw.js'), 'utf8');
   const shell = JSON.parse(sw.match(/const SHELL = (\[[\s\S]*?\]);/)[1].replace(/'/g, '"'));
-  for (const f of ['lift-core.js', 'exercises.js', 'lift.js']) assert.ok(shell.includes(f), f);
+  for (const f of ['lift-core.js', 'exercises.js', 'wods.js', 'lift.js']) assert.ok(shell.includes(f), f);
   shell.filter((f) => f !== './').forEach((f) => assert.ok(fs.existsSync(path.join(__dirname, '..', f)), f));
 });
 
@@ -172,6 +172,147 @@ test('routines: stats and whether one is worth saving', () => {
   assert.equal(L.routineHasContent(r), true);
   assert.deepEqual(L.routineStats(r), { exercises: 2, sets: 5, muscles: ['core'] });
   assert.equal(L.routineHasContent(L.newRoutine('Legs')), true);
+});
+
+/* ---- Workout of the day ---- */
+const wodBox = { self: {} };
+vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', 'wods.js'), 'utf8'), wodBox);
+const WODS = JSON.parse(JSON.stringify(wodBox.self.PLATE_WODS));
+const wodOf = (format) => WODS.find((w) => w.format === format);
+
+test('wods: every workout is complete, and links only to real exercises', () => {
+  assert.ok(WODS.length >= 20);
+  assert.equal(new Set(WODS.map((w) => w.id)).size, WODS.length);
+  assert.equal(new Set(WODS.map((w) => w.name)).size, WODS.length);
+  const gear = L.WOD_EQUIPMENT.map((x) => x.id);
+  for (const w of WODS) {
+    assert.ok(L.WOD_FORMATS.some((f) => f.id === w.format), w.id);
+    assert.ok(w.about.trim() && w.equipment.length && w.equipment.every((g) => gear.includes(g)), w.id);
+    for (const level of ['beginner', 'intermediate', 'advanced']) {
+      const [minutes, scheme, moves] = w.levels[level];
+      assert.ok(minutes > 0 && scheme.trim() && moves.length, `${w.id} ${level}`);
+      moves.forEach(([text, ex]) => {
+        assert.ok(text.trim(), `${w.id} ${level}`);
+        if (ex) assert.ok(byId(ex), `${w.id} ${level} links to missing ${ex}`);
+      });
+    }
+  }
+});
+
+test('wods: levels really scale, so beginners never get more time pressure or an advanced lift', () => {
+  const advanced = LIB.filter((e) => e.level === 'advanced').map((e) => e.id);
+  for (const w of WODS) {
+    assert.ok(w.levels.beginner[0] <= w.levels.intermediate[0] && w.levels.intermediate[0] <= w.levels.advanced[0], `${w.id} length grows with level`);
+    w.levels.beginner[2].forEach(([, ex]) => assert.ok(!advanced.includes(ex), `${w.id} gives a beginner ${ex}`));
+    assert.notDeepEqual(w.levels.beginner[2], w.levels.advanced[2], w.id);
+  }
+});
+
+test('wods: each format and common equipment are covered', () => {
+  L.WOD_FORMATS.forEach((f) => assert.ok(WODS.filter((w) => w.format === f.id).length >= 5, f.id));
+  assert.ok(WODS.filter((w) => w.equipment.includes('none')).length >= 5, 'enough to do with no gear');
+});
+
+test('daily pick: same date gives the same workout, and every workout gets a turn', () => {
+  assert.equal(L.wodForDate(WODS, '2026-11-04').id, L.wodForDate(WODS, '2026-11-04').id);
+  assert.notEqual(L.wodForDate(WODS, '2026-11-04').id, L.wodForDate(WODS, '2026-11-05').id);
+  const seen = new Set();
+  const d = new Date(Date.UTC(2026, 0, 1));
+  for (let i = 0; i < WODS.length; i++) { seen.add(L.wodForDate(WODS, d.toISOString().slice(0, 10)).id); d.setUTCDate(d.getUTCDate() + 1); }
+  assert.equal(seen.size, WODS.length);
+  assert.equal(L.wodForDate([], '2026-11-04'), null);
+  assert.equal(L.wodForDate(WODS, '1960-01-01') != null, true, 'dates before 1970 still work');
+});
+
+test('wod session: copies its version, so later edits to the list cannot change a result', () => {
+  const w = JSON.parse(JSON.stringify(wodOf('amrap')));
+  const s = L.newWodSession(w, 'intermediate', 1000000, 10);
+  assert.deepEqual([s.status, s.name, s.startedAt, s.wod.level, s.wod.minutes, s.exercises.length], ['active', w.name, 1010000, 'intermediate', w.levels.intermediate[0], 0]);
+  w.levels.intermediate[2][0][0] = 'changed';
+  assert.notEqual(s.wod.moves[0][0], 'changed');
+  assert.equal(L.newWodSession(w, 'nonsense', 1000000).wod.level, 'beginner');
+});
+
+test('wod clock: get ready, then counts, and pausing holds it', () => {
+  const T = 1000000;
+  const s = L.newWodSession(wodOf('emom'), 'beginner', T, 10);
+  const mins = s.wod.minutes;
+  let c = L.wodClock(s, T + 3000);
+  assert.deepEqual([c.ready, c.readyMs, c.elapsedMs], [true, 7000, 0]);
+  c = L.wodClock(s, T + 10000 + 65000);
+  assert.deepEqual([c.ready, c.elapsedMs, c.minute, c.minuteLeftMs, c.timeUp], [false, 65000, 2, 55000, false]);
+  L.pauseSession(s, T + 10000 + 65000);
+  assert.equal(L.wodClock(s, T + 500000).elapsedMs, 65000);
+  L.resumeSession(s, T + 500000);
+  assert.equal(L.wodClock(s, T + 501000).elapsedMs, 66000);
+  c = L.wodClock(s, T + 9e8);
+  assert.deepEqual([c.timeUp, c.leftMs, c.minute, c.minuteLeftMs], [true, 0, mins, 0]);
+});
+
+test('wod score: reads each format, and rejects nonsense', () => {
+  assert.deepEqual(L.readWodScore('for_time', { mins: '12', secs: '5' }, 15).score, { secs: 725, capped: false });
+  assert.deepEqual(L.readWodScore('for_time', { mins: '', secs: '45' }, 15).score, { secs: 45, capped: false });
+  assert.deepEqual(L.readWodScore('for_time', { capped: true }, 15).score, { secs: 900, capped: true });
+  for (const bad of [{ mins: '', secs: '' }, { mins: '0', secs: '0' }, { mins: '5', secs: '60' }, { mins: 'x', secs: '1' }, { mins: '-1', secs: '1' }, { mins: '1.5', secs: '1' }]) assert.ok(L.readWodScore('for_time', bad, 15).error, JSON.stringify(bad));
+  assert.deepEqual(L.readWodScore('amrap', { rounds: '4', reps: '' }, 12).score, { rounds: 4, reps: 0 });
+  assert.deepEqual(L.readWodScore('amrap', { rounds: '0', reps: '7' }, 12).score, { rounds: 0, reps: 7 });
+  for (const bad of [{ rounds: '', reps: '3' }, { rounds: '0', reps: '0' }, { rounds: '2.5', reps: '' }]) assert.ok(L.readWodScore('amrap', bad, 12).error, JSON.stringify(bad));
+  assert.deepEqual(L.readWodScore('emom', { done: '8' }, 10).score, { done: 8, of: 10 });
+  for (const bad of ['', '0', '11', 'x']) assert.ok(L.readWodScore('emom', { done: bad }, 10).error, bad);
+});
+
+test('wod score: reads naturally', () => {
+  assert.equal(L.formatWodScore('for_time', { secs: 725, capped: false }), '12:05');
+  assert.equal(L.formatWodScore('for_time', { secs: 900, capped: true }), 'Time cap');
+  assert.equal(L.formatWodScore('amrap', { rounds: 1, reps: 0 }), '1 round');
+  assert.equal(L.formatWodScore('amrap', { rounds: 4, reps: 7 }), '4 rounds + 7 reps');
+  assert.equal(L.formatWodScore('emom', { done: 8, of: 10 }), '8/10 minutes');
+});
+
+function wodResult(w, level, score, startedAt) {
+  const s = L.newWodSession(w, level, startedAt);
+  return L.finishWod(s, score, startedAt + 600000);
+}
+
+test('wod best: right direction per format, and never compared across levels', () => {
+  const t = wodOf('for_time'), a = wodOf('amrap');
+  const list = [
+    wodResult(t, 'beginner', { secs: 700, capped: false }, 1000000), wodResult(t, 'beginner', { secs: 650, capped: false }, 2000000),
+    wodResult(t, 'beginner', { secs: 900, capped: true }, 3000000), wodResult(t, 'advanced', { secs: 100, capped: false }, 4000000),
+    wodResult(a, 'beginner', { rounds: 3, reps: 9 }, 5000000), wodResult(a, 'beginner', { rounds: 4, reps: 0 }, 6000000),
+  ];
+  assert.equal(L.bestWodResult(list, t.id, 'beginner').wod.score.secs, 650);
+  assert.equal(L.bestWodResult(list, t.id, 'advanced').wod.score.secs, 100);
+  assert.equal(L.bestWodResult(list, t.id, 'intermediate'), null);
+  assert.equal(L.bestWodResult(list, a.id, 'beginner').wod.score.rounds, 4);
+  assert.deepEqual(L.wodResults(list, t.id, 'beginner').map((s) => s.startedAt), [3000000, 2000000, 1000000]);
+  assert.equal(L.bestWodResult([list[2]], t.id, 'beginner'), null, 'only hitting the cap is not a best');
+});
+
+test('wod finish: time matches the score, and finishing twice changes nothing', () => {
+  const T = 1000000;
+  const s = L.newWodSession(wodOf('for_time'), 'beginner', T);
+  L.finishWod(s, { secs: 300, capped: false }, T + 999999);
+  assert.equal(s.status, 'completed');
+  assert.equal(L.sessionDuration(s), 300000);
+  const end = s.endedAt;
+  L.finishWod(s, { secs: 1, capped: false }, T + 2e6);
+  assert.deepEqual([s.endedAt, s.wod.score.secs], [end, 300]);
+  const a = L.newWodSession(wodOf('amrap'), 'beginner', T);
+  L.finishWod(a, { rounds: 2, reps: 0 }, T + 60000);
+  assert.equal(L.sessionDuration(a), 60000, 'stopping early counts the time actually done');
+  const logged = L.newWodSession(wodOf('amrap'), 'beginner', T);
+  logged.wod.logged = true;
+  L.finishWod(logged, { rounds: 2, reps: 0 }, T + 5);
+  assert.equal(L.sessionDuration(logged), logged.wod.minutes * 60000);
+});
+
+test('wod results stay out of lifting numbers but count as workouts', () => {
+  const r = wodResult(wodOf('amrap'), 'beginner', { rounds: 3, reps: 0 }, 1000000);
+  assert.equal(L.lastPerformance([r], 'plank'), null);
+  const sum = L.periodSummary([r], 0, 9e12);
+  assert.deepEqual([sum.workouts, sum.sets, sum.volumeKg], [1, 0, 0]);
+  assert.ok(sum.durationMs > 0);
 });
 
 /* ---- Workouts ---- */

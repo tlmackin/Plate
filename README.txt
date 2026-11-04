@@ -1,6 +1,11 @@
 PLATE — food & macro log (v1.3, with friends)
 ================================================
 
+WHAT'S NEW IN 1.6
+- WOD (workout of the day) in the Lift tab: everyone gets the same workout each day, with Beginner,
+  Intermediate and Advanced versions. Your level is saved to your account. Includes a timer for each
+  format, and your results and best scores at each level.
+
 WHAT'S NEW IN 1.5
 - Record workouts in the Lift tab: weights, reps and sets as you go, with last time's numbers beside you
   and a rest timer. A workout saves itself as you go and can be picked back up after a reload or lost signal.
@@ -84,6 +89,7 @@ then attach it in Nourish the way your dietitian prefers.
 FILES
 index.html, app.js, core.js, styles.css  the app
 lift.js, lift-core.js, exercises.js      the Lift tab and its exercise library
+wods.js                                  the workouts of the day
 tests/                                   automated checks, not used by the app itself
 config.js                                your Supabase settings (step 6)
 supabase-setup.sql                       database setup (step 3), not used by the app itself

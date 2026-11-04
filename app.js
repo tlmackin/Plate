@@ -5,7 +5,7 @@
   'use strict';
   const C = window.Core;
   const { r1, num, MEALS } = C;
-  const VERSION = '1.5.0';
+  const VERSION = '1.6.0';
   const $ = (s, el = document) => el.querySelector(s);
   const $$ = (s, el = document) => [...el.querySelectorAll(s)];
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -34,6 +34,7 @@
     return {
       get: (k) => tx('readonly', (s) => s.get(k)),
       set: (k, v) => tx('readwrite', (s) => s.put(v, k)),
+      setBoth: (k1, v1, k2, v2) => tx('readwrite', (s) => { s.put(v1, k1); s.put(v2, k2); }), // both are saved, or neither is
       del: (k) => tx('readwrite', (s) => s.delete(k)),
       keys: () => tx('readonly', (s) => s.getAllKeys()),
       clear: () => tx('readwrite', (s) => s.clear()),
@@ -49,10 +50,9 @@
   const saveMeta = () => DB.set(META_KEY, meta);
   /* Every app write goes through put(): saved locally right away, then queued for upload. */
   async function put(k, v) {
-    await DB.set(k, v);
     meta.updated[k] = Math.max(Date.now(), (meta.updated[k] || 0) + 1);
     if (!meta.dirty.includes(k)) meta.dirty.push(k);
-    await saveMeta();
+    await DB.setBoth(k, v, META_KEY, meta); // together, so a change can't be saved here but never marked for upload
     Sync.schedule();
   }
 
@@ -1392,6 +1392,6 @@
   }
   window.__plate = { S, C, DB, makePDF, buildReport, Sync, get meta() { return meta; } }; // for debugging
   /* What lift.js needs from here. Everything else in this file stays private. */
-  window.PlateApp = { DB, put, S, C, $, $$, esc, ICON, toast, owner: () => meta.owner, openSheet, closeSheets, sheetHead, wireClose, sheetsOpen: () => sheets.length > 0 };
+  window.PlateApp = { DB, put, S, C, $, $$, esc, ICON, toast, owner: () => meta.owner, topSheet: () => (sheets.length ? sheets[sheets.length - 1].el : null), openSheet, closeSheets, sheetHead, wireClose, sheetsOpen: () => sheets.length > 0 };
   boot();
 })();
