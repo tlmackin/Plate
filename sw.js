@@ -1,8 +1,8 @@
 /* Plate service worker: app files work offline; always fetches fresh files when online. */
-const CACHE = 'plate-v1.1.0';
+const CACHE = 'plate-v1.3.1';
 const SHELL = ['./', 'index.html', 'styles.css', 'core.js', 'app.js', 'manifest.webmanifest', 'config.js', 'lib/supabase.js',
   'lib/html5-qrcode.min.js', 'lib/jspdf.umd.min.js', 'lib/jspdf.plugin.autotable.min.js',
-  'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png'];
+  'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png', 'fonts/plus-jakarta-sans-latin-wght-normal.woff2'];
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
 });

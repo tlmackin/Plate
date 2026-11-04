@@ -226,7 +226,33 @@
     return '﻿' + L.join('\r\n');
   }
 
+  /* ---------- Friends ---------- */
+  const normalizeUsername = (s) => String(s == null ? '' : s).trim().replace(/^@+/, '').toLowerCase();
+  const validUsername = (s) => /^[a-z0-9_]{3,20}$/.test(s);
+
+  /* A friend's day comes from someone else's account, so it's untrusted: keep only the fields the
+     diary displays, as the expected types, so malformed data can't break or inject into the page. */
+  function cleanSharedDay(raw) {
+    const obj = (v) => (v && typeof v === 'object' ? v : {});
+    const n0 = (v) => num(v) || 0;
+    const str = (v) => (typeof v === 'string' ? v : '');
+    const r = obj(raw), t = obj(r.targets);
+    const entries = (Array.isArray(r.entries) ? r.entries : []).filter((e) => e && e.food && MEALS.includes(e.meal)).map((e) => {
+      const nut = obj(e.food.nut);
+      return {
+        meal: e.meal, qty: n0(e.qty), unit: Number.isInteger(e.unit) ? e.unit : 0,
+        food: {
+          name: str(e.food.name) || 'Food', brand: str(e.food.brand),
+          nut: { kcal: n0(nut.kcal), p: n0(nut.p), c: n0(nut.c), f: n0(nut.f) },
+          units: (Array.isArray(e.food.units) ? e.food.units : []).map((u) => ({ label: str(obj(u).label), factor: n0(obj(u).factor) })),
+        },
+      };
+    });
+    return { entries, targets: { kcal: n0(t.kcal), p: n0(t.p), c: n0(t.c), f: n0(t.f) } };
+  }
+
   const api = { r1, num, kcalFromMacros, fromOFF, fromUSDA, fromManual, entryNut, sumEntries, amountLabel,
-    ymd, parseYmd, addDays, weekStart, weekDays, barcodeVariants, MEALS, weekReport, reportCSV, titleCase };
+    ymd, parseYmd, addDays, weekStart, weekDays, barcodeVariants, MEALS, weekReport, reportCSV, titleCase,
+    normalizeUsername, validUsername, cleanSharedDay };
   if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.Core = api;
 })(typeof self !== 'undefined' ? self : this);

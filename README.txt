@@ -1,5 +1,23 @@
-PLATE — food & macro log (v1.1, with accounts)
+PLATE — food & macro log (v1.3, with friends)
 ================================================
+
+WHAT'S NEW IN 1.3
+- A brighter, more modern look, in both light and dark mode. Nothing about your data changes.
+
+WHAT'S NEW IN 1.2
+- Friends tab: pick a username, add friends by username, and view each other's food diaries.
+- A friend request has to be accepted before anything is shared. Removing a friend stops sharing
+  right away. Friends see your diary and daily targets only, not your saved foods, saved meals,
+  email or other settings.
+
+ADDING FRIENDS TO AN EXISTING SETUP (2 minutes)
+1. Supabase > SQL Editor > New query. Open supabase-friends.sql from this folder, copy ALL of it,
+   paste it in and click Run. You should see "Success. No rows returned".
+   Your existing logs and the rules protecting them aren't changed.
+2. Copy these files into your GitHub Desktop folder (replace the old ones), commit and push.
+3. If you turned off "Allow new users to sign up" (step 9 below), your friends can't create
+   accounts until you turn it back on. It's fine to turn it off again once they've joined.
+   The built-in email sender only allows a few emails per hour, so have people sign up a few at a time.
 
 WHAT'S NEW IN 1.1
 - Sign-in screen with email + password, like MyFitnessPal. Each person has their own private account.
@@ -13,6 +31,7 @@ ONE-TIME CLOUD SETUP (about 10 minutes, free)
    need it), pick region "East US", then create the project and wait about 2 minutes for it to start.
 3. Left menu > SQL Editor > New query. Open supabase-setup.sql from this folder, copy ALL of it,
    paste it in and click Run. You should see "Success. No rows returned".
+   Then do the same with supabase-friends.sql.
 4. Left menu > Authentication > URL Configuration:
      Site URL:       https://tlmackin.github.io/plate/
      Redirect URLs:  add https://tlmackin.github.io/plate/
@@ -54,5 +73,7 @@ FILES
 index.html, app.js, core.js, styles.css  the app
 config.js                                your Supabase settings (step 6)
 supabase-setup.sql                       database setup (step 3), not used by the app itself
+supabase-friends.sql                     database setup for friends, run once after supabase-setup.sql
 sw.js, manifest.webmanifest, icons/      what makes it installable and work offline
 lib/                                     barcode scanner, PDF maker, Supabase client
+fonts/                                   the app's font (Plus Jakarta Sans, Open Font License)

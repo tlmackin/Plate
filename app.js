@@ -1,10 +1,11 @@
 /* Plate — a macro tracker. Data is kept on the device (IndexedDB) and synced to the
-   signed-in person's private cloud account (Supabase) when one is configured. */
+   signed-in person's private cloud account (Supabase) when one is configured.
+   Friends can view each other's diaries through server functions; those are never stored here. */
 (function () {
   'use strict';
   const C = window.Core;
   const { r1, num, MEALS } = C;
-  const VERSION = '1.1.0';
+  const VERSION = '1.3.1';
   const $ = (s, el = document) => el.querySelector(s);
   const $$ = (s, el = document) => [...el.querySelectorAll(s)];
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -92,7 +93,20 @@
         }
         return out;
       },
-      async wipe() { chk(await sb.from(T).delete().neq('key', '')); },
+      async wipe() {
+        const r = await sb.rpc('plate_forget_me');
+        if (r.error && r.error.code !== 'PGRST202') throw r.error; // PGRST202: friends SQL not installed yet, nothing to forget
+        chk(await sb.from(T).delete().neq('key', ''));
+      },
+      friends: {
+        myUsername: async () => chk(await sb.rpc('plate_my_username')),
+        setUsername: async (username) => chk(await sb.rpc('plate_set_username', { p_username: username })),
+        list: async () => chk(await sb.rpc('plate_friends')),
+        request: async (username) => chk(await sb.rpc('plate_friend_request', { p_username: username })),
+        accept: async (id) => chk(await sb.rpc('plate_friend_accept', { p_other: id })),
+        remove: async (id) => chk(await sb.rpc('plate_friend_remove', { p_other: id })),
+        day: async (id, date) => chk(await sb.rpc('plate_friend_day', { p_friend: id, p_date: date })),
+      },
     };
   }
   const remote = makeRemote();
@@ -229,7 +243,15 @@
     scan: '<svg viewBox="0 0 24 24"><path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3M7 9v6M10 9v6M13 9v6M17 9v6"/></svg>',
     search: '<svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5"/></svg>',
     star: '<svg viewBox="0 0 24 24"><path d="M12 3l2.6 5.6 6 .7-4.5 4.1 1.2 6L12 16.4 6.7 19.4l1.2-6L3.4 9.3l6-.7z"/></svg>',
+    plus: '<svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>',
   };
+  const MEAL_ICON = {
+    Breakfast: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M5.6 18.4L7 17M17 7l1.4-1.4"/></svg>',
+    Lunch: '<svg viewBox="0 0 24 24"><path d="M3 11h18a9 9 0 0 1-6 8.5V21H9v-1.5A9 9 0 0 1 3 11z"/><path d="M9 7c0-1.5 1-1.5 1-3M14 7c0-1.5 1-1.5 1-3"/></svg>',
+    Dinner: '<svg viewBox="0 0 24 24"><path d="M7 3v7a2 2 0 0 0 2 2v9M5 3v5M9 3v5M17 21v-7h-2V7a4 4 0 0 1 3-4v18"/></svg>',
+    Snacks: '<svg viewBox="0 0 24 24"><path d="M12 8c-2-2-7-1.500-7 4 0 5 3.500 9 5.500 9 .7 0 1-.5 1.500-.5s.8.5 1.500.5c2 0 5.500-4 5.500-9 0-5.500-5-6-7-4z"/><path d="M12 8c0-2 1-4 3-5"/></svg>',
+  };
+  const mealTitle = (m) => `<span class="meal-ic m-${m.toLowerCase()}">${MEAL_ICON[m] || ''}</span><h2>${m}</h2>`;
 
   /* ---- Sheets (stacked, Android back button closes them) ---- */
   const sheets = [];
@@ -291,10 +313,26 @@
   function render() {
     $$('.tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === S.tab));
     window.scrollTo(0, 0);
-    ({ diary: renderDiary, foods: renderFoods, report: renderReport, settings: renderSettings })[S.tab]();
+    ({ diary: renderDiary, foods: renderFoods, friends: renderFriends, report: renderReport, settings: renderSettings })[S.tab]();
   }
 
   /* ================= Diary ================= */
+  function diarySummary(tot, T) {
+    const left = (T.kcal || 0) - tot.kcal;
+    const pct = T.kcal ? Math.min(1, tot.kcal / T.kcal) : 0;
+    const CIRC = 2 * Math.PI * 48;
+    const bar = (cls, name, val, tgt) => {
+      const p = tgt ? Math.min(100, (val / tgt) * 100) : 0;
+      return `<div class="bar ${cls}"><div class="top"><b>${name}</b><span class="num">${Math.round(val)} / ${tgt || '—'} g</span></div>
+        <div class="trk"><div class="fill ${tgt && val > tgt ? 'over' : ''}" style="width:${p}%"></div></div></div>`;
+    };
+    return `<section class="card summary">
+      <div class="ring"><svg viewBox="0 0 116 116"><circle class="trk" cx="58" cy="58" r="48" fill="none"/>
+        <circle class="val ${left < 0 ? 'over' : ''}" cx="58" cy="58" r="48" fill="none" stroke-linecap="round" stroke-dasharray="${CIRC}" stroke-dashoffset="${CIRC * (1 - pct)}"/></svg>
+        <div class="lbl"><b class="num">${Math.abs(Math.round(left))}</b><span>${left < 0 ? 'kcal over' : 'kcal left'}</span><span class="num">${Math.round(tot.kcal)} / ${T.kcal || '—'}</span></div></div>
+      <div class="bars">${bar('p', 'Protein', tot.p, T.p)}${bar('c', 'Carbs', tot.c, T.c)}${bar('f', 'Fat', tot.f, T.f)}</div>
+    </section>`;
+  }
   async function renderDiary() {
     const d = S.date;
     $('#topbar').innerHTML = `
@@ -309,25 +347,11 @@
 
     const entries = await getDay(d);
     if (d !== S.date || S.tab !== 'diary') return;
-    const tot = C.sumEntries(entries), T = S.settings.targets;
-    const left = (T.kcal || 0) - tot.kcal;
-    const pct = T.kcal ? Math.min(1, tot.kcal / T.kcal) : 0;
-    const CIRC = 2 * Math.PI * 48;
-    const bar = (cls, name, val, tgt) => {
-      const p = tgt ? Math.min(100, (val / tgt) * 100) : 0;
-      return `<div class="bar ${cls}"><div class="top"><b>${name}</b><span class="num">${Math.round(val)} / ${tgt || '—'} g</span></div>
-        <div class="trk"><div class="fill ${tgt && val > tgt ? 'over' : ''}" style="width:${p}%"></div></div></div>`;
-    };
-    let html = `<section class="card summary">
-      <div class="ring"><svg viewBox="0 0 116 116"><circle class="trk" cx="58" cy="58" r="48" fill="none"/>
-        <circle class="val ${left < 0 ? 'over' : ''}" cx="58" cy="58" r="48" fill="none" stroke-linecap="round" stroke-dasharray="${CIRC}" stroke-dashoffset="${CIRC * (1 - pct)}"/></svg>
-        <div class="lbl"><b class="num">${Math.abs(Math.round(left))}</b><span>${left < 0 ? 'kcal over' : 'kcal left'}</span><span class="num">${Math.round(tot.kcal)} / ${T.kcal || '—'}</span></div></div>
-      <div class="bars">${bar('p', 'Protein', tot.p, T.p)}${bar('c', 'Carbs', tot.c, T.c)}${bar('f', 'Fat', tot.f, T.f)}</div>
-    </section>`;
+    let html = diarySummary(C.sumEntries(entries), S.settings.targets);
     MEALS.forEach((m) => {
       const list = entries.filter((e) => e.meal === m);
       const mt = C.sumEntries(list);
-      html += `<section class="card"><div class="meal-head"><h2>${m}</h2>${list.length ? `<span class="small muted">${macroLine(mt)}</span><span class="k num">${Math.round(mt.kcal)}</span>` : ''}</div>`;
+      html += `<section class="card"><div class="meal-head">${mealTitle(m)}${list.length ? `<span class="small muted">${macroLine(mt)}</span><span class="k num">${Math.round(mt.kcal)}</span>` : ''}</div>`;
       html += list.length ? list.map((e) => {
         const n = C.entryNut(e);
         return `<button class="item" data-entry="${e.id}"><div class="main"><div class="name">${esc(e.food.name)}</div>
@@ -908,6 +932,188 @@
     toast('Saved ' + name);
   }
 
+  /* ================= Friends ================= */
+  // Held in memory only: a friend's data is fetched when viewed and never saved on this device.
+  const F = { loaded: false, username: null, list: [] };
+  const friendsOn = () => !!(remote && user && remote.friends);
+  function friendsError(e) {
+    const m = String((e && e.message) || e || '');
+    const known = {
+      plate_bad_username: 'Usernames are 3–20 letters, numbers or underscores.',
+      plate_username_taken: 'That username is taken. Try another.',
+      plate_no_username: 'Pick a username first.',
+      plate_user_not_found: 'No one has that username. Check the spelling with your friend.',
+      plate_self: "That's your own username.",
+      plate_already_friends: "You're already friends.",
+      plate_already_requested: 'You already sent them a request.',
+      plate_too_many_requests: 'You have too many requests waiting. Cancel some first.',
+      plate_request_gone: 'That request is no longer available.',
+      plate_not_friends: "You're no longer friends, so this diary isn't available.",
+    };
+    const code = Object.keys(known).find((k) => m.includes(k));
+    if (code) return known[code];
+    if (e && e.code === 'PGRST202') return "Friends isn't set up on the server yet. Run supabase-friends.sql (see the README).";
+    if (!navigator.onLine || /fetch|network|Load failed/i.test(m)) return "Can't reach the server. Friends needs a connection.";
+    return 'Something went wrong. Please try again.';
+  }
+  function setFriendsBadge() {
+    const dot = $('#friends-dot');
+    if (dot) dot.hidden = !F.list.some((x) => x.status === 'pending' && x.incoming);
+  }
+  async function loadFriends() {
+    const [username, list] = await Promise.all([remote.friends.myUsername(), remote.friends.list()]);
+    F.username = username; F.list = list || []; F.loaded = true;
+    setFriendsBadge();
+  }
+  function resetFriends() { F.loaded = false; F.username = null; F.list = []; setFriendsBadge(); }
+  const refreshFriendsBadge = () => { if (friendsOn()) loadFriends().catch((e) => console.warn('friends', e)); };
+
+  async function renderFriends() {
+    $('#topbar').innerHTML = `<h1>Friends</h1>`;
+    const v = $('#view');
+    if (!friendsOn()) {
+      v.innerHTML = `<div class="note">Friends needs an account. Cloud sign-in turns on once the app's Supabase settings are filled in — see the README.</div>`;
+      return;
+    }
+    if (!F.loaded) v.innerHTML = `<div class="note"><span class="spin"></span>Loading…</div>`;
+    try { await loadFriends(); }
+    catch (e) {
+      if (S.tab === 'friends') v.innerHTML = `<div class="note">${esc(friendsError(e))}</div>`;
+      return;
+    }
+    if (S.tab !== 'friends') return;
+    if (!F.username) return paintUsernamePrompt(v);
+
+    const friends = F.list.filter((x) => x.status === 'accepted');
+    const incoming = F.list.filter((x) => x.status === 'pending' && x.incoming);
+    const sent = F.list.filter((x) => x.status === 'pending' && !x.incoming);
+    const avatar = (name) => `<span class="avatar av${[...name].reduce((n, ch) => n + ch.charCodeAt(0), 0) % 6}" aria-hidden="true">${esc(name[0].toUpperCase())}</span>`;
+    const person = (x, actions) => `<div class="item">${avatar(x.username)}<div class="main"><div class="name">@${esc(x.username)}</div></div>${actions}</div>`;
+    v.innerHTML = `
+      <section class="card">
+        <h2 style="margin-bottom:4px">Add a friend</h2>
+        <p class="small muted" style="margin:0 0 10px">Your username is <b>@${esc(F.username)}</b> · <a href="#" id="fr-rename">Change</a></p>
+        <form class="searchbar" id="fr-add" style="margin:0">
+          <input type="text" id="fr-name" placeholder="Their username" aria-label="Friend's username" autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="send">
+          <button class="iconbtn scanbtn" type="submit" aria-label="Send friend request">${ICON.plus}</button>
+        </form>
+      </section>
+      ${incoming.length ? `<div class="section-title">Requests</div>
+        <p class="hint" style="margin:0 2px 8px">If you accept, you'll each see the other's food diary and daily targets.</p>
+        <div class="list">${incoming.map((x) => person(x, `<button class="chipbtn" data-accept="${esc(x.user_id)}">Accept</button><button class="chipbtn ghost" data-remove="${esc(x.user_id)}">Decline</button>`)).join('')}</div>` : ''}
+      <div class="section-title">Your friends</div>
+      ${friends.length ? `<div class="list">${friends.map((x) => `<button class="item" data-friend="${esc(x.user_id)}">${avatar(x.username)}<div class="main"><div class="name">@${esc(x.username)}</div><div class="sub">View diary</div></div><span class="muted">${ICON.right}</span></button>`).join('')}</div>`
+        : `<div class="note">No friends yet. Share your username, or add theirs above.</div>`}
+      ${sent.length ? `<div class="section-title">Sent</div>
+        <div class="list">${sent.map((x) => person(x, `<span class="small muted">Waiting</span><button class="chipbtn ghost" data-remove="${esc(x.user_id)}">Cancel</button>`)).join('')}</div>` : ''}
+      <p class="small muted" style="margin:14px 2px 0">Friends can see your food diary and daily targets, and you can see theirs. Your saved foods, saved meals, email and other settings stay private.</p>`;
+
+    const act = async (btn, fn, done) => {
+      btn.disabled = true;
+      try { await fn(); toast(done); }
+      catch (e) { toast(friendsError(e), 3500); }
+      if (S.tab === 'friends') renderFriends();
+    };
+    $('#fr-rename').onclick = (e) => { e.preventDefault(); openUsernameSheet(); };
+    $$('[data-accept]', v).forEach((b) => b.onclick = () => act(b, () => remote.friends.accept(b.dataset.accept), 'Friend added'));
+    $$('[data-remove]', v).forEach((b) => b.onclick = () => act(b, () => remote.friends.remove(b.dataset.remove), 'Request removed'));
+    $$('[data-friend]', v).forEach((b) => b.onclick = () => {
+      const fr = friends.find((x) => x.user_id === b.dataset.friend);
+      if (fr) openFriendDiary(fr);
+    });
+    $('#fr-add').onsubmit = async (e) => {
+      e.preventDefault();
+      const input = $('#fr-name'), name = C.normalizeUsername(input.value);
+      if (!C.validUsername(name)) { input.focus(); return toast(friendsError(new Error('plate_bad_username')), 3500); }
+      try {
+        const r = await remote.friends.request(name);
+        toast(r === 'accepted' ? `You and @${name} are now friends` : `Request sent to @${name}`);
+        if (S.tab === 'friends') renderFriends();
+      } catch (ex) { toast(friendsError(ex), 3500); }
+    };
+  }
+
+  function usernameForm(root, submitLabel, onDone) {
+    const form = $('#un-form', root), input = $('#un-name', root), err = $('#un-err', root), btn = $('button[type=submit]', form);
+    btn.textContent = submitLabel;
+    form.onsubmit = async (e) => {
+      e.preventDefault(); err.textContent = '';
+      const name = C.normalizeUsername(input.value);
+      if (!C.validUsername(name)) { err.textContent = friendsError(new Error('plate_bad_username')); return; }
+      btn.disabled = true;
+      try { F.username = await remote.friends.setUsername(name); await onDone(); }
+      catch (ex) { err.textContent = friendsError(ex); }
+      finally { if (btn.isConnected) btn.disabled = false; }
+    };
+  }
+  const usernameFields = (value = '') => `<form id="un-form">
+      <label class="f"><span>Username</span><input type="text" id="un-name" value="${esc(value)}" maxlength="21" placeholder="e.g. tim_eats" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+      <p class="auth-err" id="un-err" role="alert"></p><button class="btn" type="submit"></button>
+    </form>`;
+  function paintUsernamePrompt(v) {
+    v.innerHTML = `<section class="card"><h2 style="margin-bottom:6px">Pick a username</h2>
+      <p class="hint" style="margin:0 0 12px">Friends add you with your username, so they never need your email. 3–20 letters, numbers or underscores.</p>
+      ${usernameFields()}</section>`;
+    usernameForm(v, 'Save username', () => renderFriends());
+  }
+  function openUsernameSheet() {
+    openSheet((el) => {
+      el.innerHTML = `<div class="grab"></div>${sheetHead('Change username')}${usernameFields(F.username || '')}`;
+      wireClose(el);
+      usernameForm(el, 'Save username', async () => { await closeSheets(1); toast('Username updated'); if (S.tab === 'friends') renderFriends(); });
+    });
+  }
+
+  function openFriendDiary(fr) {
+    let date = today(), token = 0;
+    openSheet((el) => {
+      el.innerHTML = `${sheetHead('@' + fr.username, 'Diary · view only')}
+        <div class="datenav" style="margin-bottom:10px">
+          <button class="iconbtn" id="fd-prev" aria-label="Previous day">${ICON.left}</button>
+          <div class="datebtn" id="fd-date"></div>
+          <button class="iconbtn" id="fd-next" aria-label="Next day">${ICON.right}</button>
+        </div>
+        <div id="fd-body"></div>
+        <div style="margin-top:6px"><button class="btn danger" id="fd-remove">Remove friend</button></div>`;
+      wireClose(el);
+      const body = $('#fd-body', el);
+      const load = async () => {
+        const d = date, t = ++token;
+        $('#fd-date', el).innerHTML = `${esc(prettyDate(d))}<small>${esc(longDate(d))}</small><input type="date" id="fd-pick" value="${d}" aria-label="Pick a date">`;
+        $('#fd-pick', el).onchange = (e) => { if (e.target.value) { date = e.target.value; load(); } };
+        body.innerHTML = `<div class="note"><span class="spin"></span>Loading…</div>`;
+        try {
+          const day = C.cleanSharedDay(await remote.friends.day(fr.user_id, d));
+          if (t !== token) return;
+          body.innerHTML = diarySummary(C.sumEntries(day.entries), day.targets) + MEALS.map((m) => {
+            const list = day.entries.filter((e) => e.meal === m), mt = C.sumEntries(list);
+            return `<section class="card"><div class="meal-head">${mealTitle(m)}${list.length ? `<span class="small muted">${macroLine(mt)}</span><span class="k num">${Math.round(mt.kcal)}</span>` : ''}</div>
+              ${list.length ? list.map((e) => {
+                const n = C.entryNut(e);
+                return `<div class="item"><div class="main"><div class="name">${esc(e.food.name)}</div>
+                  <div class="sub">${esc(C.amountLabel(e))}${e.food.brand ? ' · ' + esc(e.food.brand) : ''}</div></div>
+                  <div class="k num">${Math.round(n.kcal)}<small>${macroLine(n)}</small></div></div>`;
+              }).join('') : `<div class="empty">Nothing logged</div>`}</section>`;
+          }).join('');
+        } catch (e) {
+          if (t === token) body.innerHTML = `<div class="note">${esc(friendsError(e))}</div>`;
+        }
+      };
+      $('#fd-prev', el).onclick = () => { date = C.addDays(date, -1); load(); };
+      $('#fd-next', el).onclick = () => { date = C.addDays(date, 1); load(); };
+      $('#fd-remove', el).onclick = async () => {
+        if (!confirm(`Remove @${fr.username}? You'll stop seeing each other's diaries.`)) return;
+        try {
+          await remote.friends.remove(fr.user_id);
+          await closeSheets(1);
+          toast('Friend removed');
+          if (S.tab === 'friends') renderFriends();
+        } catch (e) { toast(friendsError(e), 3500); }
+      };
+      load();
+    }, { full: true });
+  }
+
   /* ================= Settings ================= */
   function renderSettings() {
     $('#topbar').innerHTML = `<h1>Settings</h1>`;
@@ -993,7 +1199,7 @@
       e.target.value = '';
     };
     $('#wipe').onclick = async () => {
-      if (!confirm(cloud ? 'Erase your entire log, foods, meals and settings — on every device and in your account? This cannot be undone.' : 'Erase your entire log, foods, meals and settings on this phone? This cannot be undone.')) return;
+      if (!confirm(cloud ? 'Erase your entire log, foods, meals, settings, username and friends — on every device and in your account? This cannot be undone.' : 'Erase your entire log, foods, meals and settings on this phone? This cannot be undone.')) return;
       if (!confirm('Really erase everything? Consider downloading a backup first.')) return;
       try { if (cloud) await remote.wipe(); }
       catch (err) { return toast("Couldn't reach your account — nothing was erased. Try again online."); }
@@ -1001,6 +1207,7 @@
       await DB.clear(); S.days.clear();
       meta = Object.assign(freshMeta(), { owner }); await saveMeta();
       await loadState();
+      resetFriends();
       toast('Erased'); renderSettings();
     };
   }
@@ -1031,7 +1238,7 @@
         <form id="af">${field('a-email', 'Email', 'email', 'email', 'inputmode="email" autocapitalize="off" required')}${field('a-pw', 'Password', 'password', 'current-password', 'required')}
         <p class="auth-err" id="a-err" role="alert"></p><button class="btn" type="submit">Sign in</button></form>
         <div class="auth-links"><a href="#" data-m="forgot">Forgot password?</a><a href="#" data-m="signup">Create an account</a></div>`,
-      signup: `<h2>Create your account</h2>${note}<p class="hint">Each person gets their own private log. Use an email you can check — you'll get a confirmation link.</p>
+      signup: `<h2>Create your account</h2>${note}<p class="hint">Each person gets their own log, visible only to friends they accept. Use an email you can check — you'll get a confirmation link.</p>
         <form id="af">${field('a-email', 'Email', 'email', 'email', 'inputmode="email" autocapitalize="off" required')}${field('a-pw', 'Password (8+ characters)', 'password', 'new-password', 'minlength="8" required')}${field('a-pw2', 'Confirm password', 'password', 'new-password', 'required')}
         <p class="auth-err" id="a-err" role="alert"></p><button class="btn" type="submit">Create account</button></form>
         <div class="auth-links"><a href="#" data-m="signin">I already have an account</a></div>`,
@@ -1131,13 +1338,14 @@
     document.body.classList.remove('auth-mode'); document.body.classList.add('in-app');
     S.tab = 'diary'; S.date = today();
     render();
-    if (user) Sync.run();
+    if (user) { Sync.run(); refreshFriendsBadge(); }
     if (!appStarted) {
       appStarted = true;
       document.addEventListener('visibilitychange', () => {
         if (document.visibilityState !== 'visible' || !document.body.classList.contains('in-app')) return;
         if (S.tab === 'diary' && !sheets.length) renderDiary();
         Sync.run(); // pick up changes made on the other device
+        refreshFriendsBadge();
       });
       window.addEventListener('online', () => Sync.run());
     }
