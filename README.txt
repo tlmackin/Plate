@@ -1,6 +1,11 @@
 PLATE — food & macro log (v1.3, with friends)
 ================================================
 
+WHAT'S NEW IN 1.4
+- Lift tab: an exercise library you can search and filter, your own custom exercises, and a routine
+  builder with templates to copy. No database setup needed: it saves to your account like your food log.
+  Recording workouts comes next. Exercise instructions are general guidance, not medical advice.
+
 WHAT'S NEW IN 1.3
 - A brighter, more modern look, in both light and dark mode. Nothing about your data changes.
 
@@ -71,6 +76,8 @@ then attach it in Nourish the way your dietitian prefers.
 
 FILES
 index.html, app.js, core.js, styles.css  the app
+lift.js, lift-core.js, exercises.js      the Lift tab and its exercise library
+tests/                                   automated checks, not used by the app itself
 config.js                                your Supabase settings (step 6)
 supabase-setup.sql                       database setup (step 3), not used by the app itself
 supabase-friends.sql                     database setup for friends, run once after supabase-setup.sql

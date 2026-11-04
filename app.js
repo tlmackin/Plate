@@ -5,7 +5,7 @@
   'use strict';
   const C = window.Core;
   const { r1, num, MEALS } = C;
-  const VERSION = '1.3.1';
+  const VERSION = '1.4.0';
   const $ = (s, el = document) => el.querySelector(s);
   const $$ = (s, el = document) => [...el.querySelectorAll(s)];
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -194,6 +194,7 @@
     const d = DEFAULT_SETTINGS();
     S.settings = Object.assign(d, settings || {}, { targets: Object.assign(d.targets, (settings && settings.targets) || {}) });
     S.myFoods = myFoods || []; S.favs = favs || []; S.recents = recents || []; S.meals = meals || [];
+    await window.PlateLift.load();
   }
   const save = (k) => put(k, S[k]);
   const saveSettings = () => put('settings', S.settings);
@@ -313,7 +314,7 @@
   function render() {
     $$('.tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === S.tab));
     window.scrollTo(0, 0);
-    ({ diary: renderDiary, foods: renderFoods, friends: renderFriends, report: renderReport, settings: renderSettings })[S.tab]();
+    ({ diary: renderDiary, foods: renderFoods, lift: window.PlateLift.render, friends: renderFriends, report: renderReport, settings: renderSettings })[S.tab]();
   }
 
   /* ================= Diary ================= */
@@ -1199,7 +1200,7 @@
       e.target.value = '';
     };
     $('#wipe').onclick = async () => {
-      if (!confirm(cloud ? 'Erase your entire log, foods, meals, settings, username and friends — on every device and in your account? This cannot be undone.' : 'Erase your entire log, foods, meals and settings on this phone? This cannot be undone.')) return;
+      if (!confirm(cloud ? 'Erase your entire log, foods, meals, workout routines, settings, username and friends — on every device and in your account? This cannot be undone.' : 'Erase your entire log, foods, meals, workout routines and settings on this phone? This cannot be undone.')) return;
       if (!confirm('Really erase everything? Consider downloading a backup first.')) return;
       try { if (cloud) await remote.wipe(); }
       catch (err) { return toast("Couldn't reach your account — nothing was erased. Try again online."); }
@@ -1384,5 +1385,7 @@
     showAuth('signin');
   }
   window.__plate = { S, C, DB, makePDF, buildReport, Sync, get meta() { return meta; } }; // for debugging
+  /* What lift.js needs from here. Everything else in this file stays private. */
+  window.PlateApp = { DB, put, S, $, $$, esc, ICON, toast, openSheet, closeSheets, sheetHead, wireClose, sheetsOpen: () => sheets.length > 0 };
   boot();
 })();
