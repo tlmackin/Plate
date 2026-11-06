@@ -5,7 +5,7 @@
   'use strict';
   const C = window.Core;
   const { r1, num, MEALS } = C;
-  const VERSION = '1.6.0';
+  const VERSION = '1.7.0';
   const $ = (s, el = document) => el.querySelector(s);
   const $$ = (s, el = document) => [...el.querySelectorAll(s)];
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));

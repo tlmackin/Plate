@@ -175,6 +175,7 @@
         ${detailList('Common mistakes', ex.mistakes)}
         ${detailList('Safety', ex.safety)}
         ${detailList('Variations', ex.variations)}
+        ${swapsHTML(ex.id)}
         ${alternatives.length ? `<section class="card lift-detail"><h2>Alternatives</h2><div class="lift-alts">${alternatives.map((a) => `<button class="item" data-alt="${esc(a.id)}"><div class="main"><div class="name">${esc(a.name)}</div><div class="sub">${esc(exerciseSub(a))}</div></div></button>`).join('')}</div></section>` : ''}
         ${ex.custom ? '' : '<p class="small muted lift-disclaimer">General guidance only. Start light, and stop if something hurts.</p>'}`;
       wireClose(el);
@@ -188,6 +189,30 @@
       if (edit) edit.onclick = () => openCustomForm({ exercise: ex, onSaved: () => A().closeSheets(1) });
       $$('[data-alt]', el).forEach((b) => { b.onclick = () => openExercise(findExercise(b.dataset.alt)); });
     }, { full: true, onClose: repaintIfOnTab });
+  }
+  /* Easier swaps for a movement you can't do yet, or don't have the equipment for. A swap can be an
+     easier version of the same exercise, so each one carries its own instructions. */
+  const SUBS = window.PLATE_WOD_SUBS || {};
+  function swapsHTML(exId) {
+    const { esc } = A();
+    const list = (SUBS[exId] || []).filter(([id]) => findExercise(id));
+    if (!list.length) return '';
+    return `<section class="card lift-detail"><h2>Can't do it yet? Try</h2><div class="lift-alts wod-swaps">${list.map(([id, how]) => {
+      const x = findExercise(id);
+      return `<button class="item" data-alt="${esc(id)}"><div class="main"><div class="name">${esc(x.name)}</div><div class="sub">${esc(how)}</div></div></button>`;
+    }).join('')}</div></section>`;
+  }
+  function openSwaps(exId) {
+    const { openSheet, sheetHead, wireClose, esc, $$ } = A();
+    const ex = findExercise(exId);
+    openSheet((el) => {
+      el.innerHTML = `<div class="grab"></div>${sheetHead(ex ? `Instead of ${ex.name}` : 'Swaps', 'Swaps')}
+        <p class="small muted" style="margin:0 2px 10px">Pick one and keep the rest of the workout the same. Note what you swapped when you save your result.</p>
+        ${swapsHTML(exId)}
+        ${ex ? `<button class="btn secondary" data-alt="${esc(ex.id)}">How to do ${esc(ex.name)}</button>` : ''}`;
+      wireClose(el);
+      $$('[data-alt]', el).forEach((b) => { b.onclick = () => openExercise(findExercise(b.dataset.alt)); });
+    });
   }
 
   /* ================= Custom exercise form ================= */
@@ -786,10 +811,11 @@
     openSheet((el) => {
       el.innerHTML = `<div class="grab"></div>${sheetHead(justFinished ? (s.wod ? 'WOD complete' : 'Workout complete') : s.name, justFinished ? s.name : date)}
         ${s.wod ? `${newBest ? `<div class="note wod-best"><b>New best</b> at ${esc(L.levelLabel(s.wod.level))} level</div>` : ''}
-          <div class="nutgrid wk-grid3"><div><b class="num">${esc(L.formatWodScore(s.wod.format, s.wod.score))}</b><span>${esc(L.wodFormatLabel(s.wod.format))}</span></div>
+          <div class="nutgrid wk-grid3"><div><b class="num">${esc(wodScoreText(s.wod, s.wod.score))}</b><span>${esc(L.wodFormatLabel(s.wod.format))}</span></div>
           <div><b class="num">${esc(L.formatClock(L.sessionDuration(s)))}</b><span>time</span></div>
           <div><b>${esc(L.levelLabel(s.wod.level))}</b><span>level</span></div></div>
-          <section class="card lift-detail"><h2>${esc(s.wod.scheme)}</h2><ul>${s.wod.moves.map((m) => `<li>${esc(m[0])}</li>`).join('')}</ul></section>`
+          ${s.wod.strength ? `<section class="card lift-detail"><h2>${esc(wt(s.wod.strength.scheme))}</h2><ul>${s.wod.strength.moves.map((m) => `<li>${esc(wt(m[0]))}</li>`).join('')}</ul></section>` : ''}
+          <section class="card lift-detail"><h2>${esc(wt(s.wod.scheme))}</h2><ul>${s.wod.moves.map((m) => `<li>${esc(wt(m[0]))}</li>`).join('')}</ul></section>`
         : `<div class="nutgrid wk-grid3"><div><b class="num">${esc(L.formatClock(L.sessionDuration(s)))}</b><span>time</span></div>
           <div><b class="num">${st.done}</b><span>sets</span></div>
           <div><b class="num">${esc(volumeText(st.volumeKg))}</b><span>volume</span></div></div>`}
@@ -815,14 +841,18 @@
   }
 
   /* ================= Workout of the day ================= */
-  const wodsToday = () => L.wodForDate(WODS, A().C.ymd(new Date()));
+  const wodToday = () => L.wodDay(WODS, A().C.ymd(new Date()));
   const wodEquipmentText = (w) => w.equipment.map((id) => (L.WOD_EQUIPMENT.find((x) => x.id === id) || {}).label).filter(Boolean).join(', ');
-  const wodFormatLine = (format, minutes) => (format === 'for_time' ? `For time · ${minutes} minute cap` : `${L.wodFormatLabel(format)} · ${minutes} minutes`);
+  /* Workout text with its weights in the viewer's unit. */
+  const wt = (text) => L.wodText(text, St.prefs.unit);
+  const wodScoreText = (w, score) => L.formatWodScore(w, score, St.prefs.unit);
+  const timedScore = (w) => L.wodScoreType(w) === 'time';
   function wodMovesHTML(moves) {
     const { esc } = A();
     return `<ul class="wod-moves">${moves.map(([text, exId]) => {
       const known = exId && findExercise(exId);
-      return `<li>${known ? `<button class="wod-move" data-about="${esc(exId)}">${esc(text)}</button>` : esc(text)}</li>`;
+      const swap = known && SUBS[exId] ? `<button class="chipbtn ghost wod-swap" data-swap="${esc(exId)}" aria-label="Swaps for ${esc(known.name)}">Swap</button>` : '';
+      return `<li>${known ? `<button class="wod-move" data-about="${esc(exId)}">${esc(wt(text))}</button>` : `<span>${esc(wt(text))}</span>`}${swap}</li>`;
     }).join('')}</ul>`;
   }
   /* The workout at the current level, with the level picker. */
@@ -832,16 +862,21 @@
     const v = L.wodVersion(w, level);
     const results = L.wodResults(St.sessions, w.id, level);
     const best = L.bestWodResult(St.sessions, w.id, level);
+    const texts = v.moves.map((m) => m[0]).concat(v.strength ? v.strength.moves.map((m) => m[0]) : []);
     return `<p class="small muted wod-about">${esc(w.about)} <span class="wod-gear">${esc(wodEquipmentText(w))}</span></p>
       <div class="seg wod-levels">${L.LEVELS.map((l) => `<button data-level="${l.id}" class="${l.id === level ? 'on' : ''}" aria-pressed="${l.id === level}">${esc(l.label)}</button>`).join('')}</div>
-      <p class="wod-format"><b>${esc(wodFormatLine(w.format, v.minutes))}</b><br><span class="small muted">${esc((L.WOD_FORMATS.find((f) => f.id === w.format) || {}).short)}</span></p>
-      <h3 class="wod-scheme">${esc(v.scheme)}</h3>
+      ${w.warmup ? `<details class="wod-warmup"><summary>Warm-up</summary><ul>${w.warmup.map((x) => `<li>${esc(wt(x))}</li>`).join('')}</ul></details>` : ''}
+      ${v.strength ? `<div class="wod-part"><h3 class="wod-scheme">${esc(wt(v.strength.scheme))}</h3>${wodMovesHTML(v.strength.moves)}</div>` : ''}
+      <p class="wod-format"><b>${esc(L.wodFormatLine(v))}</b><br><span class="small muted">${esc((L.WOD_FORMATS.find((f) => f.id === w.format) || {}).short)}</span></p>
+      <h3 class="wod-scheme">${esc(wt(v.scheme))}</h3>
       ${wodMovesHTML(v.moves)}
-      <button class="btn" data-wod-start="${esc(w.id)}" style="margin-top:12px">Start timer</button>
+      ${v.note ? `<p class="small wod-note"><b>Coach's note:</b> ${esc(v.note)}</p>` : ''}
+      ${L.wodHasSplitWeights(texts) ? '<p class="small muted wod-note">Weights are shown women/men. Tap Swap next to a movement for easier options.</p>' : '<p class="small muted wod-note">Tap Swap next to a movement for easier options.</p>'}
+      <button class="btn" data-wod-start="${esc(w.id)}" style="margin-top:12px">${v.strength ? 'Start the timer for Part B' : 'Start timer'}</button>
       <button class="btn secondary" data-wod-log="${esc(w.id)}" style="margin-top:8px">Log a result without the timer</button>
       ${results.length ? `<div class="wod-results"><div class="section-title" style="margin-top:14px">Your results at this level</div>
-        ${best ? `<p class="small" style="margin:0 2px 6px"><b>Best:</b> ${esc(L.formatWodScore(best.wod.format, best.wod.score))}</p>` : ''}
-        ${results.slice(0, 5).map((s) => `<button class="item" data-summary="${esc(s.id)}"><div class="main"><div class="name num">${esc(L.formatWodScore(s.wod.format, s.wod.score))}</div><div class="sub">${esc(new Date(s.startedAt).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }))}</div></div></button>`).join('')}</div>` : ''}`;
+        ${best ? `<p class="small" style="margin:0 2px 6px"><b>Best:</b> ${esc(wodScoreText(best.wod, best.wod.score))}</p>` : ''}
+        ${results.slice(0, 5).map((s) => `<button class="item" data-summary="${esc(s.id)}"><div class="main"><div class="name num">${esc(wodScoreText(s.wod, s.wod.score))}</div><div class="sub">${esc(new Date(s.startedAt).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }))}</div></div></button>`).join('')}</div>` : ''}`;
   }
   /* Handles the buttons in a WOD card. repaint redraws the card after the level changes. */
   function wireWodCard(root, repaint) {
@@ -853,6 +888,7 @@
         A().put('wo:prefs', St.prefs);
         repaint();
       } else if (d.about) { const ex = findExercise(d.about); if (ex) openExercise(ex); }
+      else if (d.swap) openSwaps(d.swap);
       else if (d.wodStart) startWod(WODS.find((w) => w.id === d.wodStart));
       else if (d.wodLog) openWodResult({ wod: WODS.find((w) => w.id === d.wodLog) });
       else if (d.summary) { const s = St.sessions.find((x) => x.id === d.summary); if (s) openSummary(s); }
@@ -871,7 +907,7 @@
     const { openSheet, sheetHead, wireClose, $ } = A();
     openSheet((el) => {
       const paint = () => { $('#wod-card', el).innerHTML = wodCardHTML(wod); };
-      el.innerHTML = `<div class="grab"></div>${sheetHead(wod.name, 'WOD')}<div id="wod-card"></div>`;
+      el.innerHTML = `<div class="grab"></div>${sheetHead(wod.name, wod.retired ? 'WOD · original set' : 'WOD')}<div id="wod-card"></div>`;
       wireClose(el);
       paint();
       wireWodCard($('#wod-card', el), paint);
@@ -883,55 +919,71 @@
     W.s = session;
     keepScreenOn();
     updateMini();
-    let lastMinute = null, wasReady = true, timeUpHandled = L.wodClock(session).timeUp;
+    const intervalFormat = (w) => w.format === 'intervals' || w.format === 'tabata';
+    const minuteFormat = (w) => w.format === 'emom' || w.format === 'death_by';
+    const stepKey = (w, c) => (intervalFormat(w) ? `${c.round}-${c.phase}` : minuteFormat(w) ? String(c.minute) : '');
+    let lastStep = null, wasReady = true, timeUpHandled = L.wodClock(session).timeUp;
     openSheet((el) => {
       el.classList.add('wk-sheet');
       const w = session.wod;
+      const counter = w.format === 'amrap' && L.wodScoreType(w) === 'rounds';
       el.innerHTML = `<div class="sheet-head"><button class="iconbtn" data-close aria-label="Minimize WOD">${ICON.down}</button>
-          <h3>${esc(session.name)}<span class="brand">${esc(L.levelLabel(w.level))} · ${esc(wodFormatLine(w.format, w.minutes))}</span></h3></div>
+          <h3>${esc(session.name)}<span class="brand">${esc(L.levelLabel(w.level))} · ${esc(L.wodFormatLine(w))}</span></h3></div>
         <section class="card wod-clock"><div class="small muted" id="wod-label" aria-live="polite"></div><b class="num" id="wod-time" role="timer"></b><div class="small muted" id="wod-sub"></div></section>
-        ${w.format === 'amrap' ? `<section class="card wod-rounds"><span>Rounds finished</span><b class="num" id="wod-rounds">${w.rounds}</b>
+        ${counter ? `<section class="card wod-rounds"><span>Rounds finished</span><b class="num" id="wod-rounds">${w.rounds}</b>
           <button class="wk-restbtn" id="wod-less" aria-label="One round fewer">−1</button><button class="btn wod-plus" id="wod-more">+1 round</button></section>` : ''}
-        <section class="card"><h2 style="margin-bottom:6px">${esc(w.scheme)}</h2>${wodMovesHTML(w.moves)}</section>
+        <section class="card"><h2 style="margin-bottom:6px">${esc(wt(w.scheme))}</h2>${wodMovesHTML(w.moves)}</section>
         <div class="btnrow" style="margin-bottom:10px"><button class="btn secondary" id="wod-pause"></button><button class="btn" id="wod-finish"></button></div>
         <button class="btn danger" id="wod-discard" style="margin-bottom:16px">Discard</button>`;
       wireClose(el);
       const paint = () => {
         const s = W.s; if (!s) return;
+        const sw = s.wod;
         const c = L.wodClock(s);
         const paused = s.status === 'paused';
         const labelEl = $('#wod-label', el), timeEl = $('#wod-time', el), subEl = $('#wod-sub', el);
         el.classList.toggle('wod-ready', c.ready);
+        el.classList.toggle('wod-resting', !c.ready && c.phase === 'rest');
         if (c.ready) {
           labelEl.textContent = 'Get ready';
           timeEl.textContent = String(Math.ceil(c.readyMs / 1000));
           subEl.textContent = '';
-        } else if (s.wod.format === 'for_time') {
-          labelEl.textContent = paused ? 'Paused' : c.timeUp ? 'Time cap reached' : 'Time';
+        } else if (timedScore(sw) || sw.format === 'for_load') {
+          const load = sw.format === 'for_load';
+          labelEl.textContent = paused ? 'Paused' : c.timeUp ? (load ? 'Time is up' : 'Time cap reached') : 'Time';
           timeEl.textContent = L.formatClock(c.elapsedMs);
-          subEl.textContent = c.timeUp ? '' : `${L.formatClock(c.leftMs)} left before the cap`;
-        } else if (s.wod.format === 'amrap') {
+          subEl.textContent = c.timeUp ? '' : `${L.formatClock(c.leftMs)} left ${load ? 'in the window' : 'before the cap'}`;
+        } else if (intervalFormat(sw)) {
+          labelEl.textContent = paused ? 'Paused' : c.timeUp ? 'Time!' : `${c.phase === 'work' ? 'Work' : 'Rest'} · round ${c.round} of ${c.intervals}`;
+          timeEl.textContent = L.formatClock(c.timeUp ? 0 : c.phaseLeftMs);
+          subEl.textContent = c.timeUp ? '' : `${L.formatClock(c.leftMs)} left in the workout`;
+        } else if (minuteFormat(sw)) {
+          const unitName = sw.every && sw.every !== 60 ? 'Round' : 'Minute';
+          labelEl.textContent = paused ? 'Paused' : c.timeUp ? 'Time!' : sw.format === 'death_by' ? `Minute ${c.minute}` : `${unitName} ${c.minute} of ${c.intervals}`;
+          timeEl.textContent = L.formatClock(c.minuteLeftMs);
+          subEl.textContent = c.timeUp ? '' : sw.format === 'death_by' ? 'Tap Finish when you can no longer keep up' : `${L.formatClock(c.leftMs)} left in the workout`;
+        } else {
           labelEl.textContent = paused ? 'Paused' : c.timeUp ? 'Time!' : 'Time left';
           timeEl.textContent = L.formatClock(c.leftMs);
           subEl.textContent = '';
-        } else {
-          labelEl.textContent = paused ? 'Paused' : c.timeUp ? 'Time!' : `Minute ${c.minute} of ${s.wod.minutes}`;
-          timeEl.textContent = L.formatClock(c.minuteLeftMs);
-          subEl.textContent = c.timeUp ? '' : `${L.formatClock(c.leftMs)} left in the workout`;
         }
         $('#wod-pause', el).textContent = paused ? 'Resume' : 'Pause';
         $('#wod-pause', el).disabled = c.ready;
-        $('#wod-finish', el).textContent = s.wod.format === 'for_time' ? 'Done' : 'Finish';
+        $('#wod-finish', el).textContent = timedScore(sw) ? 'Done' : 'Finish';
         const roundsEl = $('#wod-rounds', el);
-        if (roundsEl) roundsEl.textContent = s.wod.rounds;
+        if (roundsEl) roundsEl.textContent = sw.rounds;
       };
-      /* Sounds fire once each, and only while the app is on screen. */
+      /* Sounds fire once each, and only while the app is on screen: at the start, at each new minute
+         or interval, and at the end. */
       W.wodTick = () => {
         const s = W.s; if (!s || !s.wod) return;
         const c = L.wodClock(s);
-        if (wasReady && !c.ready) { chime(); lastMinute = c.minute; }
+        if (wasReady && !c.ready) { chime(); lastStep = stepKey(s.wod, c); }
         wasReady = c.ready;
-        if (s.status === 'active' && !c.ready && !c.timeUp && s.wod.format === 'emom' && c.minute !== lastMinute) { lastMinute = c.minute; chime(); }
+        if (s.status === 'active' && !c.ready && !c.timeUp) {
+          const step = stepKey(s.wod, c);
+          if (step && step !== lastStep) { lastStep = step; chime(); }
+        }
         if (s.status === 'active' && c.timeUp && !timeUpHandled) {
           timeUpHandled = true;
           chime();
@@ -946,6 +998,7 @@
       el.addEventListener('click', async (e) => {
         const b = e.target.closest('button'); if (!b || !W.s) return;
         if (b.dataset.about) { const ex = findExercise(b.dataset.about); if (ex) openExercise(ex); return; }
+        if (b.dataset.swap) return openSwaps(b.dataset.swap);
         if (b.id === 'wod-more') return addRound(1);
         if (b.id === 'wod-less') return addRound(-1);
         if (b.id === 'wod-pause' && !b.disabled) {
@@ -977,38 +1030,52 @@
       },
     });
   }
-  /* Record a score: { session } from the timer, or { wod } to log without one. */
+  /* Record a score: { session } from the timer, or { wod } to log without one. The form asks for
+     whatever the workout is scored by: a time, rounds and reps, minutes, total reps, or a weight. */
   function openWodResult({ session, wod }) {
     const { openSheet, sheetHead, wireClose, closeSheets, $, toast, esc } = A();
-    const version = session ? session.wod : Object.assign({ format: wod.format, level: St.prefs.wodLevel }, L.wodVersion(wod, St.prefs.wodLevel));
+    const version = session ? session.wod : L.wodVersion(wod, St.prefs.wodLevel);
     const { format, minutes } = version;
+    const kind = L.wodScoreType(version);
+    const intervals = version.work ? version.count : Math.max(1, Math.round((minutes * 60) / (version.every || 60)));
     const name = session ? session.name : wod.name;
     const wodId = session ? session.wod.id : wod.id;
-    const level = session ? session.wod.level : St.prefs.wodLevel;
+    const level = session ? session.wod.level : version.level;
     const clock = session ? L.wodClock(session) : null;
+    const unit = St.prefs.unit;
     let saving = false;
     openSheet((el) => {
-      const mins = clock ? Math.floor(Math.min(clock.elapsedMs, minutes * 60000) / 60000) : '';
-      const secs = clock ? Math.floor(Math.min(clock.elapsedMs, minutes * 60000) / 1000) % 60 : '';
-      const fields = format === 'for_time'
-        ? `<div class="grid2"><label class="f"><span>Minutes</span><input type="text" inputmode="numeric" id="wr-mins" value="${esc(mins)}"></label><label class="f"><span>Seconds</span><input type="text" inputmode="numeric" id="wr-secs" value="${esc(secs)}"></label></div>
-           <label class="lift-check-line"><input type="checkbox" id="wr-cap" ${clock && clock.timeUp ? 'checked' : ''}><span>I hit the ${minutes} minute cap</span></label>`
-        : format === 'amrap'
-          ? `<div class="grid2"><label class="f"><span>Rounds finished</span><input type="text" inputmode="numeric" id="wr-rounds" value="${session ? esc(session.wod.rounds) : ''}"></label><label class="f"><span>Extra reps</span><input type="text" inputmode="numeric" id="wr-reps" placeholder="0"></label></div>`
-          : `<label class="f"><span>Minutes finished, out of ${minutes}</span><input type="text" inputmode="numeric" id="wr-done" value="${clock ? esc(Math.min(minutes, clock.minute)) : ''}"></label>`;
+      const ran = clock ? Math.min(clock.elapsedMs, Math.round(minutes * 60000)) : 0;
+      const field = (id, text, value, extra) => `<label class="f"><span>${text}</span><input type="text" inputmode="${extra || 'numeric'}" id="${id}" value="${esc(value)}"></label>`;
+      let fields;
+      if (kind === 'time') {
+        fields = `<div class="grid2">${field('wr-mins', 'Minutes', clock ? Math.floor(ran / 60000) : '')}${field('wr-secs', 'Seconds', clock ? Math.floor(ran / 1000) % 60 : '')}</div>
+           <label class="lift-check-line"><input type="checkbox" id="wr-cap" ${clock && clock.timeUp ? 'checked' : ''}><span>I hit the ${minutes} minute cap</span></label>`;
+      } else if (kind === 'rounds') {
+        const deathBy = format === 'death_by';
+        const guess = !session ? '' : deathBy ? Math.max(0, clock.minute - 1) : session.wod.rounds;
+        fields = `<div class="grid2">${field('wr-rounds', deathBy ? 'Full minutes finished' : 'Rounds finished', guess)}${field('wr-reps', deathBy ? 'Reps in the last minute' : 'Extra reps', '')}</div>`;
+      } else if (kind === 'reps') {
+        fields = field('wr-reps', 'Total reps (or calories)', '');
+      } else if (kind === 'load') {
+        fields = field('wr-load', `Heaviest weight lifted (${unit})`, '', 'decimal');
+      } else {
+        const what = version.every && version.every !== 60 ? 'Rounds' : 'Minutes';
+        fields = field('wr-done', `${what} finished in time, out of ${intervals}`, clock ? Math.min(intervals, clock.minute) : '');
+      }
       el.innerHTML = `<div class="grab"></div>${sheetHead('Your result', `${name} · ${L.levelLabel(level)}`)}${fields}
-        <label class="f"><span>Notes (optional)</span><textarea id="wr-note" rows="2" placeholder="What did you change? How did it feel?"></textarea></label>
+        <label class="f"><span>Notes (optional)</span><textarea id="wr-note" rows="2" placeholder="What did you swap or change? How did it feel?"></textarea></label>
         <button class="btn" id="wr-save">Save result</button>`;
       wireClose(el);
       const val = (id) => { const n = $(id, el); return n ? n.value : ''; };
       $('#wr-save', el).onclick = async () => {
         if (saving) return; // a second tap can't save it twice
         const capBox = $('#wr-cap', el);
-        const read = L.readWodScore(format, { mins: val('#wr-mins'), secs: val('#wr-secs'), capped: !!(capBox && capBox.checked), rounds: val('#wr-rounds'), reps: val('#wr-reps'), done: val('#wr-done') }, minutes);
+        const read = L.readWodScore(version, { mins: val('#wr-mins'), secs: val('#wr-secs'), capped: !!(capBox && capBox.checked), rounds: val('#wr-rounds'), reps: val('#wr-reps'), done: val('#wr-done'), load: val('#wr-load') }, { minutes, intervals, unit });
         if (read.error) return toast(read.error);
         saving = true;
         const before = L.bestWodResult(St.sessions, wodId, level);
-        const target = session || Object.assign(L.newWodSession(wod, level), {});
+        const target = session || L.newWodSession(wod, level);
         if (!session) target.wod.logged = true;
         clearTimeout(W.saveTimer); W.saveTimer = null;
         target.note = val('#wr-note').trim();
@@ -1016,8 +1083,8 @@
         W.s = null; W.wodTick = null;
         await saveSession(target);
         await closeSheets(99); // the form and anything behind it, which would now show old results
-        const value = L.wodScoreValue(format, read.score);
-        const isBest = !!before && value !== -Infinity && value > L.wodScoreValue(format, before.wod.score);
+        const value = L.wodScoreValue(target.wod, read.score);
+        const isBest = !!before && value !== -Infinity && value > L.wodScoreValue(before.wod, before.wod.score);
         openSummary(target, true, isBest);
       };
     });
@@ -1095,7 +1162,7 @@
         <div><b class="num">${week.sets}</b><span>sets</span></div><div><b class="num">${Math.round(L.fromKg(week.volumeKg, St.prefs.unit)).toLocaleString('en-US')}</b><span>${esc(St.prefs.unit)} volume</span></div></div>
       ${recent.length ? `<div class="section-title">Recent workouts</div><div class="list">${recent.map((s) => {
         const st = L.sessionStats(s);
-        const detail = s.wod ? `WOD · ${L.levelLabel(s.wod.level)} · ${L.formatWodScore(s.wod.format, s.wod.score)}` : `${st.done} set${st.done === 1 ? '' : 's'} · ${L.formatClock(L.sessionDuration(s))}`;
+        const detail = s.wod ? `WOD · ${L.levelLabel(s.wod.level)} · ${wodScoreText(s.wod, s.wod.score)}` : `${st.done} set${st.done === 1 ? '' : 's'} · ${L.formatClock(L.sessionDuration(s))}`;
         return `<button class="item" data-summary="${esc(s.id)}"><div class="main"><div class="name">${esc(s.name)}</div><div class="sub">${esc(new Date(s.startedAt).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }))} · ${esc(detail)}</div></div></button>`;
       }).join('')}</div>` : ''}`;
     $('#wk-empty', root).onclick = () => beginWorkout(null);
@@ -1125,10 +1192,21 @@
   }
   function wodPane(root) {
     const { esc, $, C } = A();
-    const today = wodsToday();
+    const todayYmd = C.ymd(new Date());
+    const day = L.wodDay(WODS, todayYmd);
+    const today = day.wod;
+    const next = day.rest ? L.nextWodDay(WODS, todayYmd) : null;
     const f = St.wodFilter;
-    root.innerHTML = `<div class="section-title" style="margin-top:4px">Today · ${esc(C.parseYmd(C.ymd(new Date())).toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' }))}</div>
-      <section class="card wod-today"><h2 class="wod-name">${esc(today.name)}</h2><div id="wod-card"></div></section>
+    const todayCard = today
+      ? `<section class="card wod-today"><h2 class="wod-name">${esc(today.name)}</h2><div id="wod-card"></div></section>`
+      : day.rest
+        ? `<section class="card wod-today wod-rest"><h2 class="wod-name">Rest day</h2>
+            <p class="small" style="margin:0 0 10px">Recovery is part of the program. An easy walk, some stretching, or a light bike or row all count.</p>
+            ${next ? `<button class="item" data-wod="${esc(next.wod.id)}"><div class="main"><div class="name">${esc(next.wod.name)}</div><div class="sub">Tomorrow · ${esc(L.wodFormatLabel(next.wod.format))}</div></div></button>` : ''}
+            <p class="small muted" style="margin:10px 0 0">Want to train anyway? Pick any WOD below.</p></section>`
+        : '';
+    root.innerHTML = `<div class="section-title" style="margin-top:4px">Today · ${esc(C.parseYmd(todayYmd).toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' }))}</div>
+      ${todayCard}
       <div class="section-title">All WODs</div>
       <div class="lift-filters wod-filters">
         <select id="wf-format" aria-label="Format"><option value="">Any format</option>${L.WOD_FORMATS.map((x) => `<option value="${x.id}" ${f.format === x.id ? 'selected' : ''}>${esc(x.label)}</option>`).join('')}</select>
@@ -1136,19 +1214,21 @@
       </div>
       <div id="wod-list"></div>
       <p class="small muted lift-disclaimer" style="margin-top:12px">Suggested weights are starting points. Use less whenever you need to, and stop if something hurts.</p>`;
-    const paintCard = () => { $('#wod-card', root).innerHTML = wodCardHTML(today); paintList(); };
+    /* The current rotation first, then the original set, each in name order. */
     const paintList = () => {
-      const list = WODS.filter((w) => (!f.format || w.format === f.format) && (!f.equipment || w.equipment.includes(f.equipment))).slice().sort((a, b) => a.name.localeCompare(b.name));
+      const list = WODS.filter((w) => (!f.format || w.format === f.format) && (!f.equipment || w.equipment.includes(f.equipment)))
+        .slice().sort((a, b) => (!!a.retired - !!b.retired) || a.name.localeCompare(b.name));
       $('#wod-list', root).innerHTML = list.length ? `<div class="list">${list.map((w) => {
         const best = L.bestWodResult(St.sessions, w.id, St.prefs.wodLevel);
-        return `<button class="item" data-wod="${esc(w.id)}"><div class="main"><div class="name">${esc(w.name)}</div><div class="sub">${esc(L.wodFormatLabel(w.format))} · ${esc(wodEquipmentText(w))}</div></div>${best ? `<div class="k num"><small>Best</small>${esc(L.formatWodScore(best.wod.format, best.wod.score))}</div>` : ''}</button>`;
+        return `<button class="item" data-wod="${esc(w.id)}"><div class="main"><div class="name">${esc(w.name)}</div><div class="sub">${esc(L.wodFormatLabel(w.format))} · ${esc(wodEquipmentText(w))}${w.retired ? ' · Original set' : ''}</div></div>${best ? `<div class="k num"><small>Best</small>${esc(wodScoreText(best.wod, best.wod.score))}</div>` : ''}</button>`;
       }).join('')}</div>` : '<div class="note">No WODs match. Try fewer filters.</div>';
     };
+    const paintCard = () => { if (today) $('#wod-card', root).innerHTML = wodCardHTML(today); paintList(); };
     paintCard();
-    wireWodCard($('#wod-card', root), paintCard);
+    if (today) wireWodCard($('#wod-card', root), paintCard);
     $('#wf-format', root).onchange = (e) => { f.format = e.target.value; paintList(); };
     $('#wf-gear', root).onchange = (e) => { f.equipment = e.target.value; paintList(); };
-    $('#wod-list', root).addEventListener('click', (e) => {
+    root.addEventListener('click', (e) => {
       const row = e.target.closest('[data-wod]');
       if (row) openWodDetail(WODS.find((w) => w.id === row.dataset.wod));
     });

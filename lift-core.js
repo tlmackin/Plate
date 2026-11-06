@@ -330,79 +330,193 @@
      Everyone gets the same workout on the same date, in the version for their level. A result is a
      normal completed session with a wod field and no exercises, so sync, history and weekly totals all
      apply, and it keeps its own copy of the workout as it was that day.
-     wod field = { id, format, level, minutes, scheme, moves, rounds, logged, score }
-     score: for_time { secs, capped }, amrap { rounds, reps }, emom { done, of } */
+     wod field = { id, format, scoreType, level, minutes, every, work, rest, count, scheme, moves, strength, rounds, logged, score }
+     Scores by type: time { secs, capped }, rounds { rounds, reps }, minutes { done, of }, reps { reps }, load { w, unit }.
+     Results saved before scoreType existed are read from their format. */
   const WOD_FORMATS = [
     { id: 'for_time', label: 'For time', short: 'Finish as fast as you can' },
     { id: 'amrap', label: 'AMRAP', short: 'As many rounds as possible' },
-    { id: 'emom', label: 'EMOM', short: 'Every minute on the minute' },
+    { id: 'emom', label: 'EMOM', short: 'Work at the start of each interval, and rest for what is left' },
+    { id: 'intervals', label: 'Intervals', short: 'Go hard while the clock says work, and recover when it says rest' },
+    { id: 'tabata', label: 'Tabata', short: '20 seconds of work, then 10 seconds of rest' },
+    { id: 'death_by', label: 'Death by', short: 'More reps every minute, until you can no longer finish them inside the minute' },
+    { id: 'for_load', label: 'For load', short: 'Build to a heavy weight with good form' },
   ];
-  const WOD_EQUIPMENT = [['none', 'No equipment'], ['dumbbell', 'Dumbbells'], ['kettlebell', 'Kettlebell'], ['barbell', 'Barbell'], ['pullup', 'Pull-up bar'], ['rower', 'Rowing machine'], ['other', 'Other equipment']].map(([id, lbl]) => ({ id, label: lbl }));
+  const WOD_SCORE = { for_time: 'time', amrap: 'rounds', emom: 'minutes', intervals: 'reps', tabata: 'reps', death_by: 'rounds', for_load: 'load' };
+  const WOD_EQUIPMENT = [['none', 'No equipment'], ['dumbbell', 'Dumbbells'], ['kettlebell', 'Kettlebell'], ['barbell', 'Barbell'], ['pullup', 'Pull-up bar'],
+    ['rower', 'Rowing machine'], ['bike', 'Air bike'], ['jumprope', 'Jump rope'], ['box', 'Box'], ['wallball', 'Wall ball'], ['other', 'Other equipment']].map(([id, lbl]) => ({ id, label: lbl }));
   const wodFormatLabel = (id) => label(WOD_FORMATS, id);
-  /* The date picks the workout, using the calendar day itself so that time zones and devices agree. */
-  function wodForDate(list, ymd) {
-    if (!list || !list.length) return null;
-    const [y, m, d] = String(ymd).split('-').map(Number);
-    const day = Math.floor(Date.UTC(y, m - 1, d) / 86400000);
-    return list[((day % list.length) + list.length) % list.length];
+  /* w is a workout, a saved wod field, or just a format id. */
+  const wodScoreType = (w) => (typeof w === 'string' ? WOD_SCORE[w] || w : w.scoreType || WOD_SCORE[w.format] || 'time');
+
+  /* The date picks the workout, using the calendar day itself so that time zones and devices agree.
+     The rotation runs three training days, then a rest day. Retired workouts stay findable for old
+     results and the list, but never come up as the day's workout. */
+  const mod = (n, m) => ((n % m) + m) % m;
+  const dayNumber = (ymd) => { const [y, m, d] = String(ymd).split('-').map(Number); return Math.floor(Date.UTC(y, m - 1, d) / 86400000); };
+  const ymdOf = (day) => new Date(day * 86400000).toISOString().slice(0, 10);
+  const wodRotation = (list) => (list || []).filter((w) => !w.retired);
+  function wodDay(list, ymd) {
+    const rot = wodRotation(list);
+    if (!rot.length) return { wod: null, rest: false };
+    const day = dayNumber(ymd);
+    const pos = mod(day, 4);
+    if (pos === 3) return { wod: null, rest: true };
+    return { wod: rot[mod(Math.floor(day / 4) * 3 + pos, rot.length)], rest: false };
   }
+  const wodForDate = (list, ymd) => wodDay(list, ymd).wod;
+  /* The next day with a workout, for showing what's coming on a rest day. */
+  function nextWodDay(list, ymd) {
+    const start = dayNumber(ymd);
+    for (let i = 1; i <= 4; i++) { const d = wodDay(list, ymdOf(start + i)); if (d.wod) return { ymd: ymdOf(start + i), wod: d.wod }; }
+    return null;
+  }
+
+  /* One level of a workout, filled in with the timing it shares with the other levels.
+     Old workouts store a level as [minutes, scheme, moves]. Intervals work out their own length. */
   function wodVersion(wod, level) {
-    const v = wod.levels[level] || wod.levels.beginner;
-    return { minutes: v[0], scheme: v[1], moves: v[2] };
+    const lv = wod.levels[level] ? level : 'beginner';
+    const v = wod.levels[lv];
+    const o = Array.isArray(v) ? { minutes: v[0], scheme: v[1], moves: v[2] } : Object.assign({}, v);
+    ['every', 'work', 'rest', 'count'].forEach((k) => { if (o[k] == null && wod[k] != null) o[k] = wod[k]; });
+    if (wod.format === 'tabata') { if (o.work == null) o.work = 20; if (o.rest == null) o.rest = 10; }
+    if (wod.format === 'intervals' || wod.format === 'tabata') o.minutes = (o.count * o.work + (o.count - 1) * (o.rest || 0)) / 60;
+    else { delete o.work; delete o.rest; delete o.count; }
+    if (wod.format === 'emom' || wod.format === 'death_by') o.every = o.every || 60; else delete o.every;
+    o.level = lv; o.format = wod.format; o.scoreType = wodScoreType(wod);
+    return o;
   }
+  /* "EMOM · 12 minutes", "Every 3 minutes · 6 rounds", "Tabata · 8 rounds of 0:20 on, 0:10 off". */
+  function wodFormatLine(v) {
+    const span = (secs) => (secs % 60 === 0 ? `${secs / 60} minute${secs === 60 ? '' : 's'}` : formatClock(secs * 1000));
+    switch (v.format) {
+      case 'for_time': return `For time · ${v.minutes} minute cap`;
+      case 'amrap': return `AMRAP · ${v.minutes} minutes`;
+      case 'emom': return v.every && v.every !== 60 ? `Every ${span(v.every)} · ${Math.round((v.minutes * 60) / v.every)} rounds` : `EMOM · ${v.minutes} minutes`;
+      case 'intervals': case 'tabata': return `${wodFormatLabel(v.format)} · ${v.count} rounds of ${formatClock(v.work * 1000)} on, ${formatClock((v.rest || 0) * 1000)} off`;
+      case 'death_by': return `Death by · up to ${v.minutes} minutes`;
+      case 'for_load': return `For load · ${v.minutes} minutes`;
+      default: return wodFormatLabel(v.format);
+    }
+  }
+  /* Workouts write weights in pounds as {women/men} or {one}, and show them in the viewer's unit.
+     Kilos round to whole numbers up to 25 kg, like dumbbells, kettlebells and balls, and to 2.5 kg above. */
+  const WEIGHT_TOKEN = /\{(\d+(?:\.\d+)?)(?:\/(\d+(?:\.\d+)?))?\}/g;
+  function wodText(text, unit) {
+    const kg = unit === 'kg';
+    const show = (lb) => {
+      if (!kg) return String(Number(lb));
+      const k = Number(lb) * KG_PER_LB;
+      return String(k < 25 ? Math.max(1, Math.round(k)) : Math.round(k / 2.5) * 2.5);
+    };
+    return String(text == null ? '' : text).replace(WEIGHT_TOKEN, (_, a, b) => `${b ? `${show(a)}/${show(b)}` : show(a)} ${kg ? 'kg' : 'lb'}`);
+  }
+  const wodHasSplitWeights = (texts) => texts.some((t) => /\{\d+(?:\.\d+)?\/\d/.test(String(t)));
+
   /* countdownSec: a short "get ready" before the clock starts. */
   function newWodSession(wod, level, now, countdownSec) {
     const t = (now || Date.now()) + (countdownSec || 0) * 1000;
     const v = wodVersion(wod, level);
     const s = newSession(null, null, {}, t);
     s.name = wod.name;
-    s.wod = { id: wod.id, format: wod.format, level: wod.levels[level] ? level : 'beginner', minutes: v.minutes, scheme: v.scheme,
-      moves: JSON.parse(JSON.stringify(v.moves)), rounds: 0, logged: false, score: null };
+    const copy = (x) => JSON.parse(JSON.stringify(x));
+    s.wod = { id: wod.id, format: wod.format, scoreType: v.scoreType, level: v.level, minutes: v.minutes, scheme: v.scheme, moves: copy(v.moves),
+      rounds: 0, logged: false, score: null };
+    ['every', 'work', 'rest', 'count'].forEach((k) => { if (v[k] != null) s.wod[k] = v[k]; });
+    if (v.strength) s.wod.strength = copy(v.strength);
     return s;
   }
-  /* Everything the timer shows, worked out from the session so it stays right after a reload or a pause. */
+  /* Everything the timer shows, worked out from the session so it stays right after a reload or a pause.
+     minute is the current interval for EMOM and death-by; round and phase are for intervals and Tabata. */
   function wodClock(s, now) {
+    const w = s.wod;
     const t = now || Date.now();
-    const totalMs = s.wod.minutes * 60000;
-    if (t < s.startedAt) return { ready: true, readyMs: s.startedAt - t, elapsedMs: 0, leftMs: totalMs, timeUp: false, minute: 1, minuteLeftMs: 60000 };
+    const totalMs = Math.round(w.minutes * 60000);
+    const every = (w.every || 60) * 1000;
+    const intervals = w.work ? w.count : Math.max(1, Math.round(totalMs / every));
+    if (t < s.startedAt) {
+      return { ready: true, readyMs: s.startedAt - t, elapsedMs: 0, leftMs: totalMs, timeUp: false, intervals, minute: 1, minuteLeftMs: every,
+        round: 1, phase: 'work', phaseLeftMs: (w.work || 0) * 1000 };
+    }
     const elapsedMs = sessionDuration(s, t);
-    const minute = Math.min(s.wod.minutes, Math.floor(elapsedMs / 60000) + 1);
-    return { ready: false, readyMs: 0, elapsedMs, leftMs: Math.max(0, totalMs - elapsedMs), timeUp: elapsedMs >= totalMs, minute,
-      minuteLeftMs: elapsedMs >= totalMs ? 0 : 60000 - (elapsedMs % 60000) };
+    const timeUp = elapsedMs >= totalMs;
+    const c = { ready: false, readyMs: 0, elapsedMs, leftMs: Math.max(0, totalMs - elapsedMs), timeUp, intervals,
+      minute: Math.min(intervals, Math.floor(elapsedMs / every) + 1), minuteLeftMs: timeUp ? 0 : every - (elapsedMs % every) };
+    if (w.work) {
+      const period = (w.work + (w.rest || 0)) * 1000;
+      const idx = Math.min(w.count - 1, Math.floor(elapsedMs / period));
+      const within = elapsedMs - idx * period;
+      c.round = idx + 1;
+      c.phase = timeUp ? 'done' : within < w.work * 1000 ? 'work' : 'rest';
+      c.phaseLeftMs = timeUp ? 0 : c.phase === 'work' ? w.work * 1000 - within : period - within;
+    }
+    return c;
   }
-  /* form: for_time { mins, secs, capped }, amrap { rounds, reps }, emom { done }. Returns { score } or { error }. */
-  function readWodScore(format, form, minutes) {
+  /* type: a score type, a format id, or a wod field. ctx: the time cap in minutes, or
+     { minutes, intervals, unit }. form fields: mins, secs, capped, rounds, reps, done, load.
+     Returns { score } or { error }. */
+  function readWodScore(type, form, ctx) {
+    const kind = wodScoreType(type);
+    const o = typeof ctx === 'object' && ctx ? ctx : { minutes: ctx };
+    const blank = (v) => String(v == null ? '' : v).trim() === '';
     const whole = (v) => { const n = cleanNumber(v, 'reps'); return n != null && Number.isInteger(n) ? n : null; };
-    if (format === 'for_time') {
-      if (form.capped) return { score: { secs: minutes * 60, capped: true } };
-      const m = String(form.mins == null ? '' : form.mins).trim() === '' ? 0 : whole(form.mins);
-      const sec = String(form.secs == null ? '' : form.secs).trim() === '' ? 0 : whole(form.secs);
+    if (kind === 'time') {
+      if (form.capped) return { score: { secs: Math.round(o.minutes * 60), capped: true } };
+      const m = blank(form.mins) ? 0 : whole(form.mins);
+      const sec = blank(form.secs) ? 0 : whole(form.secs);
       if (m == null || sec == null || sec > 59) return { error: 'Enter your time in minutes and seconds' };
       if (m * 60 + sec <= 0) return { error: 'Enter your time' };
       return { score: { secs: m * 60 + sec, capped: false } };
     }
-    if (format === 'amrap') {
+    if (kind === 'rounds') {
       const r = whole(form.rounds);
-      const reps = String(form.reps == null ? '' : form.reps).trim() === '' ? 0 : whole(form.reps);
+      const reps = blank(form.reps) ? 0 : whole(form.reps);
       if (r == null || reps == null) return { error: 'Enter the rounds you finished' };
       if (r === 0 && reps === 0) return { error: 'Enter the rounds or reps you finished' };
       return { score: { rounds: r, reps } };
     }
+    if (kind === 'reps') {
+      const reps = whole(form.reps);
+      if (reps == null || reps < 1) return { error: 'Enter your total reps' };
+      return { score: { reps } };
+    }
+    if (kind === 'load') {
+      const w = cleanNumber(form.load, 'w');
+      if (w == null || w <= 0) return { error: 'Enter the heaviest weight you lifted' };
+      return { score: { w, unit: o.unit === 'kg' ? 'kg' : 'lb' } };
+    }
+    const of = o.intervals || o.minutes;
     const done = whole(form.done);
-    if (done == null || done < 1 || done > minutes) return { error: `Enter a number of minutes from 1 to ${minutes}` };
-    return { score: { done, of: minutes } };
+    if (done == null || done < 1 || done > of) return { error: `Enter a number from 1 to ${of}` };
+    return { score: { done, of } };
   }
   /* A single number where higher is better. A finished time always beats hitting the cap. */
-  function wodScoreValue(format, score) {
-    if (format === 'for_time') return score.capped ? -Infinity : -score.secs;
-    if (format === 'amrap') return score.rounds * 10000 + score.reps;
+  function wodScoreValue(w, score) {
+    const kind = wodScoreType(w);
+    if (kind === 'time') return score.capped ? -Infinity : -score.secs;
+    if (kind === 'rounds') return score.rounds * 10000 + score.reps;
+    if (kind === 'reps') return score.reps;
+    if (kind === 'load') return toKg(score.w, score.unit);
     return score.done;
   }
-  function formatWodScore(format, score) {
+  /* unit: show a load in this unit instead of the one it was entered in. */
+  function formatWodScore(w, score, unit) {
     if (!score) return '';
-    if (format === 'for_time') return score.capped ? 'Time cap' : formatClock(score.secs * 1000);
-    if (format === 'amrap') return `${score.rounds} round${score.rounds === 1 ? '' : 's'}${score.reps ? ` + ${score.reps} reps` : ''}`;
-    return `${score.done}/${score.of} minutes`;
+    const kind = wodScoreType(w);
+    const plural = (n, one) => `${n} ${one}${n === 1 ? '' : 's'}`;
+    if (kind === 'time') return score.capped ? 'Time cap' : formatClock(score.secs * 1000);
+    if (kind === 'rounds') {
+      const main = typeof w === 'object' && w.format === 'death_by' ? plural(score.rounds, 'full minute') : plural(score.rounds, 'round');
+      return `${main}${score.reps ? ` + ${score.reps} reps` : ''}`;
+    }
+    if (kind === 'reps') return plural(score.reps, 'rep');
+    if (kind === 'load') {
+      const to = unit === 'kg' || unit === 'lb' ? unit : score.unit;
+      const n = Math.round(convertWeight(score.w, score.unit, to) * 10) / 10;
+      return `${n} ${to}`;
+    }
+    const intervalsOf = typeof w === 'object' && w.every && w.every !== 60;
+    return `${score.done}/${score.of} ${intervalsOf ? 'rounds' : 'minutes'}`;
   }
   /* Results for one workout at one level, newest first. Levels are never compared with each other. */
   const wodResults = (sessions, wodId, level) => (sessions || [])
@@ -412,9 +526,9 @@
   function bestWodResult(sessions, wodId, level) {
     let best = null;
     wodResults(sessions, wodId, level).forEach((s) => {
-      const v = wodScoreValue(s.wod.format, s.wod.score);
+      const v = wodScoreValue(s.wod, s.wod.score);
       if (v === -Infinity) return;
-      if (!best || v >= wodScoreValue(best.wod.format, best.wod.score)) best = s;
+      if (!best || v >= wodScoreValue(best.wod, best.wod.score)) best = s;
     });
     return best;
   }
@@ -422,8 +536,9 @@
     if (s.status === 'completed') return s;
     const t = now || Date.now();
     if (s.status === 'paused') resumeSession(s, t);
-    const planned = s.wod.minutes * 60000;
-    const ran = s.wod.format === 'for_time' ? (score.capped ? planned : score.secs * 1000) : s.wod.logged ? planned : Math.min(planned, Math.max(0, t - s.startedAt - (s.pausedMs || 0)));
+    const planned = Math.round(s.wod.minutes * 60000);
+    const timed = wodScoreType(s.wod) === 'time';
+    const ran = timed ? (score.capped ? planned : score.secs * 1000) : s.wod.logged ? planned : Math.min(planned, Math.max(0, t - s.startedAt - (s.pausedMs || 0)));
     if (s.wod.logged) s.startedAt = t - ran;
     s.wod.score = score;
     s.exercises = [];
@@ -431,7 +546,8 @@
     return s;
   }
 
-  const api = { WOD_FORMATS, WOD_EQUIPMENT, wodFormatLabel, wodForDate, wodVersion, newWodSession, wodClock, readWodScore, wodScoreValue, formatWodScore, wodResults, bestWodResult, finishWod,
+  const api = { WOD_FORMATS, WOD_EQUIPMENT, wodFormatLabel, wodScoreType, wodDay, wodForDate, nextWodDay, wodVersion, wodFormatLine, wodText, wodHasSplitWeights,
+    newWodSession, wodClock, readWodScore, wodScoreValue, formatWodScore, wodResults, bestWodResult, finishWod,
     MUSCLES, EQUIPMENT, LEVELS, MEASURES, REST_CHOICES, TEMPLATES, SET_TYPES, VALUE_FIELDS, muscleLabel, equipmentLabel, levelLabel, measureFields,
     cleanNumber, toKg, fromKg, convertWeight, searchExercises, validateCustom, customFromForm,
     newRoutine, newSet, newItem, addSet, removeSet, moveItem, duplicateRoutine, routineStats, routineHasContent, routineFromTemplate,

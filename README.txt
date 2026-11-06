@@ -1,6 +1,17 @@
 PLATE — food & macro log (v1.3, with friends)
 ================================================
 
+WHAT'S NEW IN 1.7
+- 30 new WODs, each with a warm-up, coach's notes and real Beginner, Intermediate and Advanced versions.
+  Weights are shown women/men, in lb or kg to match your setting. Some days add a strength part first.
+- New formats with their own timers: intervals, Tabata, "death by", every 2 or 3 minutes, and "for load"
+  days where your heaviest lift is the score.
+- The daily rotation runs three days on and one rest day. The original 24 WODs are still in the list,
+  and old results still open.
+- Swaps: tap Swap next to any movement for easier options, such as jumping pull-ups or ring rows in
+  place of pull-ups. The same list shows on each exercise's page.
+- 26 new exercises, including wall balls, box jumps, double-unders, toes-to-bar and Olympic lifts.
+
 WHAT'S NEW IN 1.6
 - WOD (workout of the day) in the Lift tab: everyone gets the same workout each day, with Beginner,
   Intermediate and Advanced versions. Your level is saved to your account. Includes a timer for each

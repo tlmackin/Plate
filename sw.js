@@ -1,5 +1,5 @@
 /* Plate service worker: app files work offline; always fetches fresh files when online. */
-const CACHE = 'plate-v1.6.0';
+const CACHE = 'plate-v1.7.0';
 const NETWORK_WAIT_MS = 3000;
 const SHELL = ['./', 'index.html', 'styles.css', 'core.js', 'app.js', 'lift-core.js', 'exercises.js', 'wods.js', 'lift.js', 'manifest.webmanifest', 'config.js', 'lib/supabase.js',
   'lib/html5-qrcode.min.js', 'lib/jspdf.umd.min.js', 'lib/jspdf.plugin.autotable.min.js',
